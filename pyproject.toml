@@ -34,6 +34,7 @@ package-dir = {"" = "src"}
 
 [project.scripts]
 autoforge = "autoforge.auto_forge:main"
+autoforge-web = "autoforge.web_app:main"
 
 [tool.pytest.ini_options]
 addopts = "--cov=autoforge --cov-report=term-missing"

@@ -1,0 +1,123 @@
+# AutoForge Web Interface - Sample Configuration
+
+# This file shows example configurations for different use cases
+# You can adjust the parameters in the web interface based on these presets
+
+## Standard Quality (Recommended Default)
+iterations: 2000
+max_layers: 75
+layer_height: 0.04
+background_height: 0.24
+background_color: "#000000"
+stl_output_size: 150
+learning_rate: 0.015
+init_tau: 1.0
+final_tau: 0.01
+warmup_fraction: 1.0
+num_init_rounds: 8
+processing_reduction_factor: 2
+nozzle_diameter: 0.4
+perform_pruning: false
+
+## High Quality (Takes Longer)
+# iterations: 6000
+# max_layers: 150
+# layer_height: 0.04
+# background_height: 0.24
+# background_color: "#000000"
+# stl_output_size: 200
+# learning_rate: 0.015
+# init_tau: 1.0
+# final_tau: 0.005
+# warmup_fraction: 1.0
+# num_init_rounds: 16
+# processing_reduction_factor: 1
+# nozzle_diameter: 0.4
+# perform_pruning: false
+
+## Fast Preview (Quick Results)
+# iterations: 1000
+# max_layers: 50
+# layer_height: 0.04
+# background_height: 0.24
+# background_color: "#000000"
+# stl_output_size: 100
+# learning_rate: 0.02
+# init_tau: 1.0
+# final_tau: 0.01
+# warmup_fraction: 0.5
+# num_init_rounds: 4
+# processing_reduction_factor: 4
+# nozzle_diameter: 0.4
+# perform_pruning: true
+# pruning_max_colors: 5
+# pruning_max_swaps: 15
+
+## Limited Filaments (8 colors, 20 swaps)
+# iterations: 3000
+# max_layers: 75
+# layer_height: 0.04
+# background_height: 0.24
+# background_color: "#000000"
+# stl_output_size: 150
+# learning_rate: 0.015
+# init_tau: 1.0
+# final_tau: 0.01
+# warmup_fraction: 1.0
+# num_init_rounds: 8
+# processing_reduction_factor: 2
+# nozzle_diameter: 0.4
+# perform_pruning: true
+# pruning_max_colors: 8
+# pruning_max_swaps: 20
+
+## Large Print (200mm+)
+# iterations: 4000
+# max_layers: 100
+# layer_height: 0.04
+# background_height: 0.32
+# background_color: "#000000"
+# stl_output_size: 250
+# learning_rate: 0.015
+# init_tau: 1.0
+# final_tau: 0.01
+# warmup_fraction: 1.0
+# num_init_rounds: 12
+# processing_reduction_factor: 2
+# nozzle_diameter: 0.4
+# perform_pruning: false
+
+## Small Print (50mm)
+# iterations: 2000
+# max_layers: 50
+# layer_height: 0.04
+# background_height: 0.24
+# background_color: "#000000"
+# stl_output_size: 50
+# learning_rate: 0.015
+# init_tau: 1.0
+# final_tau: 0.01
+# warmup_fraction: 1.0
+# num_init_rounds: 6
+# processing_reduction_factor: 2
+# nozzle_diameter: 0.4
+# perform_pruning: false
+
+# Parameter Explanations:
+#
+# iterations: Number of optimization steps. More = better quality but slower.
+# max_layers: Maximum number of filament layers in the print.
+# layer_height: Height of each layer in millimeters (typically 0.04).
+# background_height: Height of the solid base in millimeters.
+# background_color: Hex color code for the background layer.
+# stl_output_size: Size of longest dimension in the STL file (mm).
+# learning_rate: How fast the optimizer learns (0.01-0.02 typical).
+# init_tau: Starting temperature for Gumbel-Softmax (1.0 typical).
+# final_tau: Ending temperature for Gumbel-Softmax (0.01 typical).
+# warmup_fraction: Portion of iterations to keep tau at init value.
+# num_init_rounds: Number of initialization attempts for height map.
+# processing_reduction_factor: Resolution reduction (1=full, 2=half, etc.).
+# nozzle_diameter: Your 3D printer's nozzle size in millimeters.
+# perform_pruning: Whether to limit colors and swaps.
+# pruning_max_colors: Maximum number of different filaments.
+# pruning_max_swaps: Maximum number of filament changes.

@@ -5,7 +5,22 @@ AutoForge is a Python tool for generating 3D printed layered models from an inpu
 **TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work (and without the artistic control).
 
 
-## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
+## 🌐 Web Interface Available!
+
+**NEW**: AutoForge now includes a modern web interface! Run it locally with a user-friendly browser-based UI.
+
+```bash
+# Install web dependencies
+pip install flask flask-socketio python-socketio werkzeug
+
+# Start the web interface
+autoforge-web
+# Then open http://localhost:5000 in your browser
+```
+
+See [QUICKSTART_WEB.md](QUICKSTART_WEB.md) for quick start or [web/README.md](web/README.md) for full documentation.
+
+## You can also run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
 This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
 For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
 

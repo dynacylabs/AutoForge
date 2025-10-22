@@ -15,3 +15,9 @@ shapely>=2.0.7
 trimesh>=4.6.4
 joblib>=1.4.2
 pytest
+
+# Web interface dependencies
+flask>=3.0.0
+flask-socketio>=5.3.0
+python-socketio>=5.10.0
+werkzeug>=3.0.0

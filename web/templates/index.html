@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoForge - Web Interface</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔥 AutoForge</h1>
+            <p class="subtitle">Convert images to 3D-printable multi-layer models</p>
+        </header>
+
+        <div class="main-content">
+            <!-- Step 1: File Upload -->
+            <section class="section" id="upload-section">
+                <div class="section-header">
+                    <h2>Step 1: Upload Files</h2>
+                    <span class="step-badge">1</span>
+                </div>
+                <div class="section-content">
+                    <div class="upload-grid">
+                        <div class="upload-box">
+                            <label for="image-input" class="upload-label">
+                                <div class="upload-icon">🖼️</div>
+                                <h3>Input Image</h3>
+                                <p>PNG, JPG, JPEG, BMP, or WEBP</p>
+                                <input type="file" id="image-input" accept=".png,.jpg,.jpeg,.bmp,.webp" hidden>
+                                <div class="file-name" id="image-name">No file selected</div>
+                            </label>
+                            <div class="preview-container" id="image-preview"></div>
+                        </div>
+
+                        <div class="upload-box">
+                            <label for="material-input" class="upload-label">
+                                <div class="upload-icon">🎨</div>
+                                <h3>Filament Data</h3>
+                                <p>CSV or JSON from HueForge</p>
+                                <input type="file" id="material-input" accept=".csv,.json" hidden>
+                                <div class="file-name" id="material-name">No file selected</div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <button id="upload-btn" class="btn btn-primary" disabled>Upload Files</button>
+                    <div id="upload-status" class="status-message"></div>
+                </div>
+            </section>
+
+            <!-- Step 2: Configuration -->
+            <section class="section" id="config-section" style="display: none;">
+                <div class="section-header">
+                    <h2>Step 2: Configure Parameters</h2>
+                    <span class="step-badge">2</span>
+                </div>
+                <div class="section-content">
+                    <div class="config-tabs">
+                        <button class="tab-btn active" data-tab="basic">Basic</button>
+                        <button class="tab-btn" data-tab="advanced">Advanced</button>
+                        <button class="tab-btn" data-tab="output">Output</button>
+                    </div>
+
+                    <!-- Basic Settings -->
+                    <div class="tab-content active" id="basic-tab">
+                        <div class="param-grid">
+                            <div class="param-group">
+                                <label for="iterations">
+                                    Iterations
+                                    <span class="tooltip" data-tooltip="Number of optimization steps. More iterations = better quality but longer processing time">ℹ️</span>
+                                </label>
+                                <input type="number" id="iterations" value="2000" min="100" max="10000" step="100">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="max_layers">
+                                    Max Layers
+                                    <span class="tooltip" data-tooltip="Maximum number of filament layers in the print">ℹ️</span>
+                                </label>
+                                <input type="number" id="max_layers" value="75" min="10" max="200">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="layer_height">
+                                    Layer Height (mm)
+                                    <span class="tooltip" data-tooltip="Height of each layer in millimeters">ℹ️</span>
+                                </label>
+                                <input type="number" id="layer_height" value="0.04" min="0.01" max="0.2" step="0.01">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="background_height">
+                                    Background Height (mm)
+                                    <span class="tooltip" data-tooltip="Height of the solid background base">ℹ️</span>
+                                </label>
+                                <input type="number" id="background_height" value="0.24" min="0.1" max="2.0" step="0.04">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="background_color">
+                                    Background Color
+                                    <span class="tooltip" data-tooltip="Color of the background layer (hex format)">ℹ️</span>
+                                </label>
+                                <input type="color" id="background_color" value="#000000">
+                                <input type="text" id="background_color_hex" value="#000000" pattern="^#[0-9A-Fa-f]{6}$">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="stl_output_size">
+                                    STL Output Size (mm)
+                                    <span class="tooltip" data-tooltip="Size of the longest dimension of the output STL">ℹ️</span>
+                                </label>
+                                <input type="number" id="stl_output_size" value="150" min="50" max="500">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Advanced Settings -->
+                    <div class="tab-content" id="advanced-tab">
+                        <div class="param-grid">
+                            <div class="param-group">
+                                <label for="learning_rate">Learning Rate</label>
+                                <input type="number" id="learning_rate" value="0.015" min="0.001" max="0.1" step="0.001">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="init_tau">Initial Tau</label>
+                                <input type="number" id="init_tau" value="1.0" min="0.1" max="5.0" step="0.1">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="final_tau">Final Tau</label>
+                                <input type="number" id="final_tau" value="0.01" min="0.001" max="1.0" step="0.01">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="warmup_fraction">Warmup Fraction</label>
+                                <input type="number" id="warmup_fraction" value="1.0" min="0.0" max="1.0" step="0.05">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="num_init_rounds">Init Rounds</label>
+                                <input type="number" id="num_init_rounds" value="8" min="1" max="32">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="early_stopping">Early Stopping</label>
+                                <input type="number" id="early_stopping" value="2000" min="100" max="5000" step="100">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Output Settings -->
+                    <div class="tab-content" id="output-tab">
+                        <div class="param-grid">
+                            <div class="param-group">
+                                <label for="nozzle_diameter">Nozzle Diameter (mm)</label>
+                                <input type="number" id="nozzle_diameter" value="0.4" min="0.2" max="1.0" step="0.1">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="processing_reduction_factor">Processing Reduction</label>
+                                <input type="number" id="processing_reduction_factor" value="2" min="1" max="8">
+                            </div>
+
+                            <div class="param-group">
+                                <label for="min_layers">Min Layers</label>
+                                <input type="number" id="min_layers" value="0" min="0" max="100">
+                            </div>
+
+                            <div class="param-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="perform_pruning">
+                                    <span>Enable Pruning (limit colors and swaps)</span>
+                                </label>
+                            </div>
+
+                            <div class="param-group" id="pruning_colors_group" style="display: none;">
+                                <label for="pruning_max_colors">Max Colors</label>
+                                <input type="number" id="pruning_max_colors" value="8" min="1" max="50">
+                            </div>
+
+                            <div class="param-group" id="pruning_swaps_group" style="display: none;">
+                                <label for="pruning_max_swaps">Max Swaps</label>
+                                <input type="number" id="pruning_max_swaps" value="20" min="1" max="100">
+                            </div>
+                        </div>
+                    </div>
+
+                    <button id="start-btn" class="btn btn-primary">Start Optimization</button>
+                </div>
+            </section>
+
+            <!-- Step 3: Processing -->
+            <section class="section" id="processing-section" style="display: none;">
+                <div class="section-header">
+                    <h2>Step 3: Processing</h2>
+                    <span class="step-badge">3</span>
+                </div>
+                <div class="section-content">
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progress-fill"></div>
+                        </div>
+                        <div class="progress-text">
+                            <span id="progress-percentage">0%</span>
+                            <span id="progress-iteration">Iteration 0 / 0</span>
+                        </div>
+                    </div>
+
+                    <div class="status-box">
+                        <div id="status-message">Initializing...</div>
+                        <div id="loss-display">Loss: --</div>
+                    </div>
+
+                    <div class="preview-box" id="live-preview">
+                        <h3>Live Preview</h3>
+                        <img id="preview-image" src="" alt="Live preview will appear here">
+                    </div>
+
+                    <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+                </div>
+            </section>
+
+            <!-- Step 4: Results -->
+            <section class="section" id="results-section" style="display: none;">
+                <div class="section-header">
+                    <h2>Step 4: Results</h2>
+                    <span class="step-badge">4</span>
+                </div>
+                <div class="section-content">
+                    <div class="results-grid">
+                        <div class="result-card">
+                            <h3>Discretized Image</h3>
+                            <img id="result-image" src="" alt="Result">
+                            <button class="btn btn-small" onclick="downloadFile('discretized.png')">
+                                Download PNG
+                            </button>
+                        </div>
+
+                        <div class="result-card">
+                            <h3>3D Model</h3>
+                            <div class="file-icon">📦</div>
+                            <button class="btn btn-small" onclick="downloadFile('model.stl')">
+                                Download STL
+                            </button>
+                        </div>
+
+                        <div class="result-card">
+                            <h3>Swap Instructions</h3>
+                            <div class="file-icon">📝</div>
+                            <button class="btn btn-small" onclick="downloadFile('swap_instructions.txt')">
+                                Download TXT
+                            </button>
+                        </div>
+
+                        <div class="result-card">
+                            <h3>HueForge Project</h3>
+                            <div class="file-icon">🎨</div>
+                            <button class="btn btn-small" onclick="downloadFile('project.json')">
+                                Download JSON
+                            </button>
+                        </div>
+                    </div>
+
+                    <button id="new-project-btn" class="btn btn-primary">Start New Project</button>
+                </div>
+            </section>
+        </div>
+
+        <footer>
+            <p>AutoForge Web Interface | <a href="https://github.com/hvoss-techfak/AutoForge" target="_blank">GitHub</a></p>
+        </footer>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
