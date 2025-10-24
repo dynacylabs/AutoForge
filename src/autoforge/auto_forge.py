@@ -271,11 +271,31 @@ def start(args):
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif args.mps and torch.backends.mps.is_available():
-        device = torch.device("mps")
+    elif args.mps and torch.backends.mps.is_built():
+        # Try to use MPS even if is_available() returns False
+        # This can happen on some macOS configurations
+        try:
+            device = torch.device("mps")
+            # Test if MPS actually works
+            test_tensor = torch.zeros(1, device=device)
+            print("Using device: mps (Apple Silicon GPU)")
+        except Exception as e:
+            print(f"Warning: MPS requested but failed to initialize: {e}")
+            print("MPS is built but not available. Possible reasons:")
+            print("  - macOS version < 12.3")
+            print("  - PYTORCH_ENABLE_MPS_FALLBACK environment variable set")
+            print("  - System compatibility issue")
+            print("Falling back to CPU.")
+            device = torch.device("cpu")
+            print("Using device:", device)
+    elif args.mps and not torch.backends.mps.is_built():
+        print("Warning: MPS requested but PyTorch was not built with MPS support.")
+        print("Please install PyTorch with MPS support for Apple Silicon.")
+        device = torch.device("cpu")
+        print("Using device:", device)
     else:
         device = torch.device("cpu")
-    print("Using device:", device)
+        print("Using device:", device)
 
     os.makedirs(args.output_folder, exist_ok=True)
 
