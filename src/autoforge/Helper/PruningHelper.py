@@ -78,14 +78,24 @@ def prune_num_colors(
         clear_material_id = int(material_TDs_np.argmax())
         print(f"FlatForge mode: Treating material {clear_material_id} as clear/translucent (not counted in max_colors)")
     
-    def count_colored_materials(dg: torch.Tensor) -> int:
-        """Count distinct materials, excluding the clear material in FlatForge mode."""
+    def count_total_materials(dg: torch.Tensor) -> tuple[int, int]:
+        """
+        Count distinct materials in the solution.
+        
+        Returns:
+            tuple: (total_materials, colored_materials_only)
+            - total_materials: All distinct materials including clear
+            - colored_materials_only: Distinct materials excluding clear (in FlatForge mode)
+        """
         distinct_mats = torch.unique(dg)
+        total = len(distinct_mats)
+        
         if is_flatforge and clear_material_id is not None:
-            # Don't count the clear material
+            # Count colored materials (excluding clear)
             colored_mats = [m for m in distinct_mats.tolist() if m != clear_material_id]
-            return len(colored_mats)
-        return len(distinct_mats)
+            colored_only = len(colored_mats)
+            return total, colored_only
+        return total, total
 
     def score_color(
         dg_base: torch.Tensor, c_from: int, c_to: int
@@ -133,12 +143,18 @@ def prune_num_colors(
                 if c_from != c_to
             ]
         
-        num_colored = count_colored_materials(best_dg)
+        total_mats, colored_mats = count_total_materials(best_dg)
         tbar.set_description(
-            f"Colored materials {num_colored} | Total {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
+            f"Total materials {total_mats} | Colored {colored_mats} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
         )
         tbar.update(1)
 
+        # Check if we've reached the target number of colors
+        # In FlatForge mode: total_mats includes clear, so we check total_mats <= max_colors_allowed
+        # In normal mode: total_mats == colored_mats, so same logic applies
+        if total_mats <= max_colors_allowed and not merge_pairs:
+            break
+        
         if not merge_pairs:
             break
 
@@ -158,19 +174,20 @@ def prune_num_colors(
                     improved = True
                     break  # move on to next outer iteration
                 else:
-                    if num_colored > max_colors_allowed:
+                    # If we're over the limit, keep the best candidate even if it increases loss
+                    total_mats, colored_mats = count_total_materials(best_dg)
+                    if total_mats > max_colors_allowed:
                         if merge_loss < c_loss:
                             c_cand = (merge_dg, merge_loss)
                             c_loss = merge_loss
             if c_cand is not None:
                 best_dg, best_loss = c_cand
-                num_colored = count_colored_materials(best_dg)
-                distinct_mats = torch.unique(best_dg)
+                total_mats, colored_mats = count_total_materials(best_dg)
                 optimizer.best_params["global_logits"] = disc_to_logits(
                     best_dg, num_materials=num_materials, big_pos=1e5
                 )
                 tbar.set_description(
-                    f"Colored materials {num_colored} | Total {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
+                    f"Total materials {total_mats} | Colored {colored_mats} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
                 )
                 improved = True
 
@@ -181,8 +198,8 @@ def prune_num_colors(
                 n_jobs=n_jobs, backend="threading", prefer="threads"
             )(delayed(score_color)(best_dg, *pair) for pair in merge_pairs)
             merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
-            num_colored = count_colored_materials(best_dg)
-            if merge_loss < best_loss or num_colored > max_colors_allowed:
+            total_mats, colored_mats = count_total_materials(best_dg)
+            if merge_loss < best_loss or total_mats > max_colors_allowed:
                 best_dg, best_loss = merge_dg, merge_loss
             else:
                 break
