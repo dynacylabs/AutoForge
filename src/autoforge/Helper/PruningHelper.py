@@ -60,9 +60,32 @@ def prune_num_colors(
     time. If none of those improve the objective we look at the next 10 percent
     and so on. In the worst case we still examine every merge, in the best case
     we stop after the first improving chunk, saving work.
+    
+    In FlatForge mode, the most transparent material (highest TD value) is treated
+    as the "clear" material and is not counted towards max_colors_allowed. This ensures
+    that when pruning_max_colors=4, you get: background + 2 colored + 1 clear = 4 total.
     """
     num_materials = optimizer.material_colors.shape[0]
     disc_global, _ = optimizer.get_discretized_solution(best=True)
+    
+    # In FlatForge mode, identify the most transparent material (the "clear" material)
+    # This material should not be counted when checking if we've reached max_colors_allowed
+    is_flatforge = hasattr(optimizer.args, 'flatforge') and optimizer.args.flatforge
+    clear_material_id = None
+    if is_flatforge:
+        # Find the material with the highest TD (transmission distance)
+        material_TDs_np = optimizer.material_TDs.cpu().numpy()
+        clear_material_id = int(material_TDs_np.argmax())
+        print(f"FlatForge mode: Treating material {clear_material_id} as clear/translucent (not counted in max_colors)")
+    
+    def count_colored_materials(dg: torch.Tensor) -> int:
+        """Count distinct materials, excluding the clear material in FlatForge mode."""
+        distinct_mats = torch.unique(dg)
+        if is_flatforge and clear_material_id is not None:
+            # Don't count the clear material
+            colored_mats = [m for m in distinct_mats.tolist() if m != clear_material_id]
+            return len(colored_mats)
+        return len(distinct_mats)
 
     def score_color(
         dg_base: torch.Tensor, c_from: int, c_to: int
@@ -91,15 +114,28 @@ def prune_num_colors(
     tbar = tqdm(total=100, leave=False)
     while True:
         distinct_mats = torch.unique(best_dg)
-        merge_pairs = [
-            (c_from.item(), c_to.item())
-            for c_from in distinct_mats
-            for c_to in distinct_mats
-            if c_from != c_to
-        ]
-
+        
+        # In FlatForge mode, don't merge the clear material with other materials
+        # and don't merge other materials into the clear material
+        if is_flatforge and clear_material_id is not None:
+            # Create merge pairs, but exclude pairs involving the clear material
+            merge_pairs = [
+                (c_from.item(), c_to.item())
+                for c_from in distinct_mats
+                for c_to in distinct_mats
+                if c_from != c_to and c_from.item() != clear_material_id and c_to.item() != clear_material_id
+            ]
+        else:
+            merge_pairs = [
+                (c_from.item(), c_to.item())
+                for c_from in distinct_mats
+                for c_to in distinct_mats
+                if c_from != c_to
+            ]
+        
+        num_colored = count_colored_materials(best_dg)
         tbar.set_description(
-            f"Colors {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
+            f"Colored materials {num_colored} | Total {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
         )
         tbar.update(1)
 
@@ -122,18 +158,19 @@ def prune_num_colors(
                     improved = True
                     break  # move on to next outer iteration
                 else:
-                    if len(distinct_mats) > max_colors_allowed:
+                    if num_colored > max_colors_allowed:
                         if merge_loss < c_loss:
                             c_cand = (merge_dg, merge_loss)
                             c_loss = merge_loss
             if c_cand is not None:
                 best_dg, best_loss = c_cand
+                num_colored = count_colored_materials(best_dg)
                 distinct_mats = torch.unique(best_dg)
                 optimizer.best_params["global_logits"] = disc_to_logits(
                     best_dg, num_materials=num_materials, big_pos=1e5
                 )
                 tbar.set_description(
-                    f"Colors {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
+                    f"Colored materials {num_colored} | Total {len(distinct_mats)} | Loss {best_loss:.4f} | Merge pairs {len(merge_pairs)}"
                 )
                 improved = True
 
@@ -144,7 +181,8 @@ def prune_num_colors(
                 n_jobs=n_jobs, backend="threading", prefer="threads"
             )(delayed(score_color)(best_dg, *pair) for pair in merge_pairs)
             merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
-            if merge_loss < best_loss or len(distinct_mats) > max_colors_allowed:
+            num_colored = count_colored_materials(best_dg)
+            if merge_loss < best_loss or num_colored > max_colors_allowed:
                 best_dg, best_loss = merge_dg, merge_loss
             else:
                 break
