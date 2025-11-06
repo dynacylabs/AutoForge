@@ -277,23 +277,24 @@ class FilamentOptimizer:
 
         effective_logits = self._apply_height_offset()
 
-        loss = loss_fn(
-            {
-                "pixel_height_logits": effective_logits,
-                "global_logits": self.params["global_logits"],
-            },
-            target=self.target,
-            tau_height=tau_height,
-            tau_global=tau_global,
-            h=self.h,
-            max_layers=self.max_layers,
-            material_colors=self.material_colors,
-            material_TDs=self.material_TDs,
-            background=self.background,
-            add_penalty_loss=10.0,
-            focus_map=None,
-            focus_strength=0.0,
-        )
+        with self.precision.autocast():
+            loss = loss_fn(
+                {
+                    "pixel_height_logits": effective_logits,
+                    "global_logits": self.params["global_logits"],
+                },
+                target=self.target,
+                tau_height=tau_height,
+                tau_global=tau_global,
+                h=self.h,
+                max_layers=self.max_layers,
+                material_colors=self.material_colors,
+                material_TDs=self.material_TDs,
+                background=self.background,
+                add_penalty_loss=10.0,
+                focus_map=None,
+                focus_strength=0.0,
+            )
 
         self.precision.backward_and_step(loss, self.optimizer)
 
