@@ -425,8 +425,10 @@ def start(args):
         optimizer.log_to_tensorboard(interval=100)
 
         if (i + 1) % 100 == 0:
+            # Only sync loss to CPU for display every 100 iterations
+            loss_scalar = loss_val.item() if torch.is_tensor(loss_val) else loss_val
             tbar.set_description(
-                f"Iteration {i + 1}, Loss = {loss_val:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
+                f"Iteration {i + 1}, Loss = {loss_scalar:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
             )
         if (
             optimizer.best_step is not None

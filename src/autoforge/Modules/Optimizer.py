@@ -304,9 +304,11 @@ class FilamentOptimizer:
         if record_best:
             self._maybe_update_best_discrete()
         # torch.cuda.empty_cache()
-        loss = loss.item()
-        self.loss = loss
-
+        
+        # Store loss as scalar attribute only for internal tracking
+        # Don't call .item() here - let caller decide when to sync
+        self.loss_tensor = loss
+        
         return loss
 
     def discretize_solution(
@@ -388,7 +390,9 @@ class FilamentOptimizer:
                 self.writer.add_scalar(
                     "Params/lr", self.optimizer.param_groups[0]["lr"], steps
                 )
-                self.writer.add_scalar("Loss/train", self.loss, steps)
+                # Only sync loss to CPU when actually logging
+                if hasattr(self, 'loss_tensor'):
+                    self.writer.add_scalar("Loss/train", self.loss_tensor.item(), steps)
 
             # Log images periodically
             if (steps + 1) % interval == 0:
