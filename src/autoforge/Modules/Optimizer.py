@@ -499,8 +499,10 @@ class FilamentOptimizer:
             self.diff_depth_map_ax.set_data(diff_map)
             self.diff_depth_map_ax.set_clim(-2.5, 2.5)
 
+            # Get loss value for display (sync to CPU only when visualizing)
+            loss_display = self.loss_tensor.item() if hasattr(self, 'loss_tensor') else 0.0
             self.fig.suptitle(
-                f"Step {self.num_steps_done}/{self.args.iterations}, Tau: {tau_g:.4f}, Loss: {self.loss:.4f}, Best Discrete Loss: {self.best_discrete_loss:.4f}"
+                f"Step {self.num_steps_done}/{self.args.iterations}, Tau: {tau_g:.4f}, Loss: {loss_display:.4f}, Best Discrete Loss: {self.best_discrete_loss:.4f}"
             )
             if self.args.disable_visualization_for_gradio != 1:
                 plt.pause(0.01)
