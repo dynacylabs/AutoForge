@@ -360,11 +360,10 @@ class PrecisionManager:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
         elif device.type == "mps":
-            # MPS supports bfloat16 and float16
-            # Use float16 for MPS as it's widely supported on M1/M2 Macs
-            print("Using float16 autocast for MPS.")
-            self.autocast_dtype = torch.float16
-            self.enabled = True
+            # MPS has issues with autocast and JIT-compiled operations
+            # causing dtype mismatches. Use float32 without autocast for now.
+            print("Using float32 for MPS (autocast disabled due to compatibility issues).")
+            self.enabled = False
 
     @contextmanager
     def autocast(self):
