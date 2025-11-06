@@ -359,11 +359,23 @@ class PrecisionManager:
                 # TF32 fallback for very old GPUs
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
+        elif device.type == "mps":
+            # MPS supports bfloat16 and float16
+            # Use float16 for MPS as it's widely supported on M1/M2 Macs
+            print("Using float16 autocast for MPS.")
+            self.autocast_dtype = torch.float16
+            self.enabled = True
 
     @contextmanager
     def autocast(self):
         if self.enabled:
-            with torch.cuda.amp.autocast(dtype=self.autocast_dtype):
+            if self.device.type == "cuda":
+                with torch.cuda.amp.autocast(dtype=self.autocast_dtype):
+                    yield
+            elif self.device.type == "mps":
+                with torch.amp.autocast(device_type="mps", dtype=self.autocast_dtype):
+                    yield
+            else:
                 yield
         else:
             yield  # FP32 path

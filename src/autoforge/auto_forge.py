@@ -402,28 +402,28 @@ def start(args):
     # Main optimization loop
     print("Starting optimization...")
     tbar = tqdm(range(args.iterations))
-    dtype = torch.bfloat16 if not args.mps else torch.float32
-    with torch.autocast(device.type, dtype=dtype):
-        for i in tbar:
-            loss_val = optimizer.step(record_best=i % args.discrete_check == 0)
+    for i in tbar:
+        loss_val = optimizer.step(record_best=i % args.discrete_check == 0)
 
-            optimizer.visualize(interval=100)
-            optimizer.log_to_tensorboard(interval=100)
+        optimizer.visualize(interval=100)
+        optimizer.log_to_tensorboard(interval=100)
 
-            if (i + 1) % 100 == 0:
-                tbar.set_description(
-                    f"Iteration {i + 1}, Loss = {loss_val:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
-                )
-            if (
-                optimizer.best_step is not None
-                and optimizer.num_steps_done - optimizer.best_step > args.early_stopping
-            ):
-                print(
-                    "Early stopping after",
-                    args.early_stopping,
-                    "steps without improvement.",
-                )
-                break
+        if (i + 1) % 100 == 0:
+            # Only sync loss to CPU for display every 100 iterations
+            loss_scalar = loss_val.item() if torch.is_tensor(loss_val) else loss_val
+            tbar.set_description(
+                f"Iteration {i + 1}, Loss = {loss_scalar:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
+            )
+        if (
+            optimizer.best_step is not None
+            and optimizer.num_steps_done - optimizer.best_step > args.early_stopping
+        ):
+            print(
+                "Early stopping after",
+                args.early_stopping,
+                "steps without improvement.",
+            )
+            break
 
     post_opt_step = 0
 
@@ -442,95 +442,94 @@ def start(args):
     )
 
     with torch.no_grad():
-        with torch.autocast(device.type, dtype=dtype):
-            if args.perform_pruning:
-                optimizer.prune(
-                    max_colors_allowed=args.pruning_max_colors,
-                    max_swaps_allowed=args.pruning_max_swaps,
-                    min_layers_allowed=args.min_layers,
-                    max_layers_allowed=args.pruning_max_layer,
-                    search_seed=True,
-                    fast_pruning=args.fast_pruning,
-                    fast_pruning_percent=args.fast_pruning_percent,
-                )
-                optimizer.log_to_tensorboard(
-                    interval=1,
-                    namespace="post_opt",
-                    step=(post_opt_step := post_opt_step + 1),
-                )
-
-            disc_global, disc_height_image = optimizer.get_discretized_solution(
-                best=True
+        if args.perform_pruning:
+            optimizer.prune(
+                max_colors_allowed=args.pruning_max_colors,
+                max_swaps_allowed=args.pruning_max_swaps,
+                min_layers_allowed=args.min_layers,
+                max_layers_allowed=args.pruning_max_layer,
+                search_seed=True,
+                fast_pruning=args.fast_pruning,
+                fast_pruning_percent=args.fast_pruning_percent,
             )
-
-            final_loss = PruningHelper.get_initial_loss(
-                optimizer.best_params["global_logits"].shape[0], optimizer
-            )
-            # write to text file
-            with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
-                f.write(f"{final_loss}")
-
-            print("Done. Saving outputs...")
-            # Save Image
-            comp_disc = optimizer.get_best_discretized_image()
-            args.max_layers = optimizer.max_layers
-
             optimizer.log_to_tensorboard(
                 interval=1,
                 namespace="post_opt",
                 step=(post_opt_step := post_opt_step + 1),
             )
 
-            comp_disc_np = comp_disc.cpu().numpy().astype(np.uint8)
-            comp_disc_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(
-                os.path.join(args.output_folder, "final_model.png"), comp_disc_np
-            )
+        disc_global, disc_height_image = optimizer.get_discretized_solution(
+            best=True
+        )
 
-            stl_filename = os.path.join(args.output_folder, "final_model.stl")
-            height_map_mm = (
-                disc_height_image.cpu().numpy().astype(np.float32)
-            ) * args.layer_height
-            generate_stl(
-                height_map_mm,
-                stl_filename,
-                args.background_height,
-                maximum_x_y_size=args.stl_output_size,
-                alpha_mask=alpha,
-            )
+        final_loss = PruningHelper.get_initial_loss(
+            optimizer.best_params["global_logits"].shape[0], optimizer
+        )
+        # write to text file
+        with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
+            f.write(f"{final_loss}")
 
-            # Swap instructions
-            background_layers = int(args.background_height // args.layer_height)
-            swap_instructions = generate_swap_instructions(
-                disc_global.cpu().numpy(),
-                disc_height_image.cpu().numpy(),
-                args.layer_height,
-                background_layers,
-                args.background_height,
-                material_names,
-            )
-            with open(
-                os.path.join(args.output_folder, "swap_instructions.txt"), "w"
-            ) as f:
-                for line in swap_instructions:
-                    f.write(line + "\n")
+        print("Done. Saving outputs...")
+        # Save Image
+        comp_disc = optimizer.get_best_discretized_image()
+        args.max_layers = optimizer.max_layers
 
-            # Project file
-            project_filename = os.path.join(args.output_folder, "project_file.hfp")
-            generate_project_file(
-                project_filename,
-                args,
-                disc_global.cpu().numpy(),
-                disc_height_image.cpu().numpy(),
-                output_target.shape[1],
-                output_target.shape[0],
-                stl_filename,
-                args.csv_file,
-            )
+        optimizer.log_to_tensorboard(
+            interval=1,
+            namespace="post_opt",
+            step=(post_opt_step := post_opt_step + 1),
+        )
 
-            print("All done. Outputs in:", args.output_folder)
-            print("Happy Printing!")
-            return final_loss
+        comp_disc_np = comp_disc.cpu().numpy().astype(np.uint8)
+        comp_disc_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(
+            os.path.join(args.output_folder, "final_model.png"), comp_disc_np
+        )
+
+        stl_filename = os.path.join(args.output_folder, "final_model.stl")
+        height_map_mm = (
+            disc_height_image.cpu().numpy().astype(np.float32)
+        ) * args.layer_height
+        generate_stl(
+            height_map_mm,
+            stl_filename,
+            args.background_height,
+            maximum_x_y_size=args.stl_output_size,
+            alpha_mask=alpha,
+        )
+
+        # Swap instructions
+        background_layers = int(args.background_height // args.layer_height)
+        swap_instructions = generate_swap_instructions(
+            disc_global.cpu().numpy(),
+            disc_height_image.cpu().numpy(),
+            args.layer_height,
+            background_layers,
+            args.background_height,
+            material_names,
+        )
+        with open(
+            os.path.join(args.output_folder, "swap_instructions.txt"), "w"
+        ) as f:
+            for line in swap_instructions:
+                f.write(line + "\n")
+
+        # Project file
+        project_filename = os.path.join(args.output_folder, "project_file.hfp")
+        generate_project_file(
+            project_filename,
+            args,
+            disc_global.cpu().numpy(),
+            disc_height_image.cpu().numpy(),
+            output_target.shape[1],
+            output_target.shape[0],
+            stl_filename,
+            args.csv_file,
+        )
+
+        print("All done. Outputs in:", args.output_folder)
+        print("Happy Printing!")
+        return final_loss
 
 
 def main():
