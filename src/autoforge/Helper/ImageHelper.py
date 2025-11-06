@@ -47,6 +47,11 @@ def resize_image_exact(img, new_w, new_h):
     return img_out
 
 
+# Cache for color space conversion matrices to avoid recreating them
+_RGB_TO_XYZ_CACHE = {}
+_WHITE_POINT_CACHE = {}
+
+
 def srgb_to_lab(srgb, eps=1e-6):
     """
     Converts an sRGB image (values in [0, 255]) to the CIELAB color space.
@@ -71,16 +76,19 @@ def srgb_to_lab(srgb, eps=1e-6):
         torch.pow(torch.clamp((srgb + 0.055) / 1.055, min=eps), 2.4),
     )
 
-    # sRGB to XYZ conversion matrix (D65 illuminant)
-    rgb_to_xyz = torch.tensor(
-        [
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041],
-        ],
-        dtype=srgb.dtype,
-        device=srgb.device,
-    )
+    # sRGB to XYZ conversion matrix (D65 illuminant) - cached per device and dtype
+    cache_key = (srgb.device, srgb.dtype)
+    if cache_key not in _RGB_TO_XYZ_CACHE:
+        _RGB_TO_XYZ_CACHE[cache_key] = torch.tensor(
+            [
+                [0.4124564, 0.3575761, 0.1804375],
+                [0.2126729, 0.7151522, 0.0721750],
+                [0.0193339, 0.1191920, 0.9503041],
+            ],
+            dtype=srgb.dtype,
+            device=srgb.device,
+        )
+    rgb_to_xyz = _RGB_TO_XYZ_CACHE[cache_key]
 
     # Reshape for matrix multiplication if needed.
     orig_shape = srgb_linear.shape
@@ -88,10 +96,12 @@ def srgb_to_lab(srgb, eps=1e-6):
     xyz = torch.matmul(srgb_linear, rgb_to_xyz.t())
     xyz = xyz.view(orig_shape)
 
-    # Normalize XYZ by the D65 white point.
-    white_point = torch.tensor(
-        [0.95047, 1.0, 1.08883], dtype=srgb.dtype, device=srgb.device
-    )
+    # Normalize XYZ by the D65 white point - cached per device and dtype
+    if cache_key not in _WHITE_POINT_CACHE:
+        _WHITE_POINT_CACHE[cache_key] = torch.tensor(
+            [0.95047, 1.0, 1.08883], dtype=srgb.dtype, device=srgb.device
+        )
+    white_point = _WHITE_POINT_CACHE[cache_key]
     xyz_scaled = xyz / white_point
 
     # Define the piecewise function f(t) used in the Lab conversion.
