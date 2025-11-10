@@ -526,6 +526,8 @@ def generate_flatforge_stls(
     layer_materials = np.full((max_layer, H, W), -1, dtype=int)
     
     # For each pixel, assign materials to layers based on disc_height_image and disc_global
+    # The key insight: we only assign colored materials up to pixel_height
+    # Any layers above pixel_height should remain -1 (they'll be filled with clear later)
     for i in range(H):
         for j in range(W):
             if not valid_mask[i, j]:
@@ -533,21 +535,14 @@ def generate_flatforge_stls(
             
             pixel_height = int(disc_height_image[i, j])
             
-            # Assign materials from layer 0 to min(pixel_height, max_layer)-1
-            # Fill any gaps in disc_global by extending the last color from below
-            # This ensures there's no clear between two colored layers
-            last_color = -1
+            # Assign materials from layer 0 to pixel_height-1
+            # We assign the material from disc_global for each layer up to pixel_height
             for layer in range(min(pixel_height, max_layer)):
                 material = int(disc_global[layer])
                 if material >= 0:
                     # This layer has a color assigned
-                    last_color = material
                     layer_materials[layer, i, j] = material
-                elif last_color >= 0:
-                    # This layer is a gap in disc_global, extend the color from below
-                    # This prevents clear from being placed between two colored layers
-                    layer_materials[layer, i, j] = last_color
-                # else: both material and last_color are -1, leave as -1
+                # If material is -1, leave layer_materials as -1 (will be handled by clear layer)
     
     # Get unique materials used (excluding background)
     unique_materials = np.unique(disc_global[:max_layer])
@@ -621,12 +616,12 @@ def generate_flatforge_stls(
         create_color_stl(mat_idx, material_name, color_hex)
     
     # Generate STL for clear/transparent areas
-    # Clear should ONLY be placed above the topmost colored material, never between colors
-    # Since gaps between colors are filled by extending the color from below during material assignment,
-    # we only need to check if the pixel height is less than max_layer (unfilled top layers)
+    # Clear should fill the space from the TOP colored layer (per pixel) up to max_layer
+    # This creates a flat top surface at max_layer height
+    # Note: Any gaps WITHIN the colored layers (if disc_global has -1) are left as voids
     print("Generating FlatForge STL for clear areas...")
     
-    # Find positions where clear is needed (above all colored materials)
+    # Find the highest colored layer for each pixel
     clear_height_map = np.zeros((H, W), dtype=float)
     clear_min_height_map = np.full((H, W), max_layer, dtype=float)
     
@@ -636,14 +631,24 @@ def generate_flatforge_stls(
             if not valid_mask[i, j]:
                 continue
             
-            pixel_height = int(disc_height_image[i, j])
+            # Find the highest layer with a colored material at this pixel
+            highest_color_layer = -1
+            for layer in range(max_layer - 1, -1, -1):
+                if layer_materials[layer, i, j] >= 0:
+                    highest_color_layer = layer
+                    break
             
-            # If pixel height is less than max_layer, fill the top with clear
-            if pixel_height < max_layer:
+            # If there's room above the highest colored layer, fill it with clear
+            if highest_color_layer < max_layer - 1:
                 has_clear = True
-                clear_min_height_map[i, j] = pixel_height
+                # Clear starts right after the highest color layer (or from 0 if no colors)
+                clear_min_height_map[i, j] = highest_color_layer + 1
                 clear_height_map[i, j] = max_layer
-            # Note: We don't check layer_materials because gaps are already filled with colors
+            elif highest_color_layer == -1 and max_layer > 0:
+                # No colored layers at all at this pixel, fill entire height with clear
+                has_clear = True
+                clear_min_height_map[i, j] = 0
+                clear_height_map[i, j] = max_layer
     
     if has_clear:
         clear_height_map_mm = clear_height_map * layer_height
