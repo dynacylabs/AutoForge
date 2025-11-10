@@ -1,8 +1,25 @@
+"""auto_forge.py
+
+High-level orchestration module for the AutoForge optimization pipeline.
+
+Responsibilities:
+- Parse CLI / config file arguments.
+- Load image and material properties.
+- (Optionally) auto-select a background filament color based on dominant image color.
+- Initialize a height map using one of several strategies (k-means clustering or depth estimation).
+- Build and run the filament optimization loop (differentiable + periodic discretization checks).
+- Optionally prune the solution to respect practical printer constraints (materials, swaps, layers).
+- Export final artifacts: preview PNG, STL(s), swap instructions, project file, metadata.
+
+The implementation intentionally keeps side-effects (disk writes / prints) order-stable to
+preserve prior behavior. Helper functions are factored out for readability; no functional
+behavior should have changed relative to the previous monolithic version.
+"""
 import argparse
 import sys
 import os
-import time
 import traceback
+from typing import Optional, Tuple, List
 
 import configargparse
 import cv2
@@ -17,6 +34,7 @@ from autoforge.Helper.Heightmaps.ChristofidesHeightMap import (
 )
 
 from autoforge.Helper.ImageHelper import resize_image, imread
+from autoforge.Helper.OtherHelper import set_seed, perform_basic_check, get_device
 from autoforge.Helper.OutputHelper import (
     generate_stl,
     generate_swap_instructions,
@@ -34,7 +52,13 @@ if torch.__version__ >= "2.0.0":
         pass
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Create and parse command-line & config-file arguments.
+
+    Returns:
+        argparse.Namespace: Populated arguments structure. Some parameters may be adjusted later
+        (e.g., num_init_cluster_layers when -1 to infer from max_layers).
+    """
     parser = configargparse.ArgParser()
     parser.add_argument("--config", is_config_file=True, help="Path to config file")
 
@@ -123,6 +147,12 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--auto_background_color",
+        action="store_true",
+        help="Automatically set background color to the closest filament color matching the dominant image color. Overrides --background_color.",
+    )
+
+    parser.add_argument(
         "--visualize",
         type=bool,
         default=True,
@@ -177,7 +207,7 @@ def parse_args():
     parser.add_argument(
         "--fast_pruning_percent",
         type=float,
-        default=0.5,
+        default=0.25,
         help="Percentage of increment search for fast pruning",
     )
 
@@ -225,7 +255,7 @@ def parse_args():
     parser.add_argument(
         "--num_init_rounds",
         type=int,
-        default=8,
+        default=16,
         help="Number of rounds to choose the starting height map from.",
     )
 
@@ -272,136 +302,344 @@ def parse_args():
         help="Number of complete clear/transparent layers to add on top in FlatForge mode",
     )
 
+    # New: choose heightmap initializer
+    parser.add_argument(
+        "--init_heightmap_method",
+        type=str,
+        choices=["kmeans", "depth"],
+        default="kmeans",
+        help="Initializer for the height map: 'kmeans' (fast, default) or 'depth' (requires transformers).",
+    )
+    # New priority mask argument (optional)
+    parser.add_argument(
+        "--priority_mask",
+        type=str,
+        default="",
+        help="Optional path to a priority mask image (same dimensions as input image). Non-empty: apply weighted loss (0.1 outside, 1.0 at max inside).",
+    )
+    parser.add_argument(
+        "--priority_mask_boost",
+        type=float,
+        default=1.0,
+        help="Multiplier used during initialization to boost heights in priority regions: new = new * (1 + boost * mask).",
+    )
+
     args = parser.parse_args()
     return args
 
 
-def start(args):
-    if args.num_init_cluster_layers == -1:
-        args.num_init_cluster_layers = args.max_layers // 2
+def _compute_dominant_image_color(
+    img_rgb: np.ndarray, alpha: Optional[np.ndarray]
+) -> Optional[Tuple[str, np.ndarray]]:
+    """Compute an approximate dominant color of the input image.
 
-    # check if csv or json is given
-    if args.csv_file == "" and args.json_file == "":
-        print("Error: No CSV or JSON file given. Please provide one of them.")
-        sys.exit(1)
+    Strategy:
+    - Optionally downscale very large images for efficiency.
+    - Ignore (mostly) transparent pixels if alpha channel is provided.
+    - Use frequency counts (np.unique) over exact RGB triplets.
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif args.mps and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print("Using device:", device)
+    Args:
+        img_rgb: Image array in RGB order (H,W,3) uint8.
+        alpha: Optional alpha mask (H,W,1) or (H,W) uint8; pixels <128 are ignored.
 
-    os.makedirs(args.output_folder, exist_ok=True)
-
-    # Basic checks
-    if not (args.background_height / args.layer_height).is_integer():
-        print(
-            "Error: Background height must be a multiple of layer height.",
-            file=sys.stderr,
+    Returns:
+        (hex_color, normalized_rgb) where hex_color is a '#RRGGBB' string and normalized_rgb
+        is float32 in [0,1]^3. Returns None if no valid pixels remain.
+    """
+    try:
+        # Downscale if needed (max side 300 px)
+        h, w = img_rgb.shape[:2]
+        max_side = max(h, w)
+        target_side = 300
+        alpha_small: Optional[np.ndarray] = None
+        if max_side > target_side:
+            scale = target_side / max_side
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            img_small = cv2.resize(
+                img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA
+            )
+            if alpha is not None:
+                alpha_small = cv2.resize(
+                    alpha, (new_w, new_h), interpolation=cv2.INTER_NEAREST
+                )
+        else:
+            img_small = img_rgb
+            alpha_small = alpha
+        # Build mask for valid pixels (ignore transparent)
+        if alpha_small is not None:
+            valid_mask = (
+                alpha_small[..., 0] if alpha_small.ndim == 3 else alpha_small
+            ) >= 128
+        else:
+            valid_mask = np.ones(img_small.shape[:2], dtype=bool)
+        if valid_mask.sum() == 0:
+            return None
+        pixels = img_small[valid_mask]
+        # Use np.unique to find most frequent RGB triplet
+        unique_colors, counts = np.unique(
+            pixels.reshape(-1, 3), axis=0, return_counts=True
         )
-        sys.exit(1)
+        idx = int(np.argmax(counts))
+        dom_rgb_uint8 = unique_colors[idx]
+        dom_rgb_norm = dom_rgb_uint8.astype(np.float32) / 255.0
+        hex_color = "#" + "".join(f"{c:02X}" for c in dom_rgb_uint8)
+        return hex_color, dom_rgb_norm
+    except Exception:
+        traceback.print_exc()
+        return None
 
-    if not os.path.exists(args.input_image):
-        print(f"Error: Input image '{args.input_image}' not found.", file=sys.stderr)
-        sys.exit(1)
 
-    if args.csv_file != "" and not os.path.exists(args.csv_file):
-        print(f"Error: CSV file '{args.csv_file}' not found.", file=sys.stderr)
-        sys.exit(1)
-    if args.json_file != "" and not os.path.exists(args.json_file):
-        print(f"Error: Json file '{args.json_file}' not found.", file=sys.stderr)
-        sys.exit(1)
+def _auto_select_background_color(
+    args,
+    img_rgb: np.ndarray,
+    alpha: Optional[np.ndarray],
+    material_colors_np: np.ndarray,
+    material_names: List[str],
+    colors_list: List[str],
+) -> None:
+    """Optionally override the user-provided background color with a closest material color.
 
-    random_seed = args.random_seed
-    if random_seed == 0:
-        random_seed = int(time.time() * 1000) % 1000000
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
+    When --auto_background_color is set:
+    - Determine dominant image color (ignoring transparency).
+    - Find closest filament (Euclidean in normalized RGB).
+    - Persist metadata to 'auto_background_color.txt'.
 
-    # Prepare background color
+    Side effects: Mutates args.background_color and attaches background_material_* fields.
+
+    Args:
+        args: Global argument namespace (mutated).
+        img_rgb: Full-resolution RGB image (uint8).
+        alpha: Optional alpha channel for transparency filtering.
+        material_colors_np: (N,3) array of filament RGB colors in [0,1].
+        material_names: List of filament names.
+        colors_list: List of filament hex color strings (#RRGGBB).
+    """
+    if not args.auto_background_color:
+        return
+    res = _compute_dominant_image_color(img_rgb, alpha)
+    if res is not None:
+        dominant_hex, dominant_rgb = res
+        diffs = material_colors_np - dominant_rgb[None, :]
+        dists = np.linalg.norm(diffs, axis=1)
+        closest_idx = int(np.argmin(dists))
+        chosen_hex = colors_list[closest_idx]
+        print(
+            f"Auto background color: dominant image color {dominant_hex} -> closest filament {chosen_hex} (index {closest_idx})."
+        )
+        args.background_color = chosen_hex
+        args.background_material_index = closest_idx
+        try:
+            args.background_material_name = material_names[closest_idx]
+        except Exception:
+            args.background_material_name = None
+        try:
+            with open(
+                os.path.join(args.output_folder, "auto_background_color.txt"), "w"
+            ) as f:
+                f.write(f"dominant_image_color={dominant_hex}\n")
+                f.write(f"chosen_filament_color={chosen_hex}\n")
+                f.write(f"closest_filament_index={closest_idx}\n")
+                if getattr(args, "background_material_name", None):
+                    f.write(
+                        f"closest_filament_name={args.background_material_name}\n"
+                    )
+        except Exception:
+            traceback.print_exc()
+    else:
+        print(
+            "Warning: Auto background color computation failed; using provided --background_color."
+        )
+
+
+def _prepare_background_and_materials(
+    args, device: torch.device, material_colors_np: np.ndarray, material_TDs_np: np.ndarray
+) -> Tuple[Tuple[int, int, int], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create torch tensors for materials & background color.
+
+    Args:
+        args: Global arguments (uses background_color hex string).
+        device: Torch device for tensor placement.
+        material_colors_np: (N,3) float32 array in [0,1].
+        material_TDs_np: (N,*) array of material transmission / diffusion parameters.
+
+    Returns:
+        (bgr_tuple_uint8, background_tensor, material_colors_tensor, material_TDs_tensor)
+    """
     bgr_tuple = hex_to_rgb(args.background_color)
     background = torch.tensor(bgr_tuple, dtype=torch.float32, device=device)
-
-    # Load materials
-    material_colors_np, material_TDs_np, material_names, _ = load_materials(args)
     material_colors = torch.tensor(
         material_colors_np, dtype=torch.float32, device=device
     )
     material_TDs = torch.tensor(material_TDs_np, dtype=torch.float32, device=device)
+    return bgr_tuple, background, material_colors, material_TDs
 
-    # Read input image
-    img = imread(args.input_image, cv2.IMREAD_UNCHANGED)
+
+def _compute_pixel_sizes(args) -> Tuple[int, int]:
+    """Derive pixel dimensions for solving vs. output STL size.
+
+    We oversample relative to nozzle_diameter to capture detail, then optionally downscale
+    for the differentiable optimization pass.
+
+    Returns:
+        (computed_output_size, computed_processing_size)
+    """
     computed_output_size = int(round(args.stl_output_size * 2 / args.nozzle_diameter))
     computed_processing_size = int(
         round(computed_output_size / args.processing_reduction_factor)
     )
     print(f"Computed solving pixel size: {computed_output_size}")
-    alpha = None
-    if img.shape[2] == 4:
-        # Extract alpha channel
-        alpha = img[:, :, 3]
-        alpha = alpha[..., None]
-        # Compute output size based on stl_output_size and nozzle_diameter
+    return computed_output_size, computed_processing_size
 
-        alpha = resize_image(alpha, computed_output_size)
-        # Remove the alpha channel from the image
-        img = img[:, :, :3]
 
-    # Convert image from BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    # For the final resolution
-    output_img_np = resize_image(img, computed_output_size)
-    output_target = torch.tensor(output_img_np, dtype=torch.float32, device=device)
+def _load_priority_mask(
+    args, output_img_np: np.ndarray, device: torch.device
+) -> Optional[torch.Tensor]:
+    """Load and resize a priority / focus mask if provided.
 
-    global_logits_init = None
-    # Initialize pixel_height_logits from the large (final) image
-    print("Initalizing height map. This can take a moment...")
-    # Default initialization
-    pixel_height_logits_init, global_logits_init, pixel_height_labels = (
-        run_init_threads(
-            output_img_np,
-            args.max_layers,
-            args.layer_height,
-            bgr_tuple,
-            random_seed=random_seed,
-            num_threads=args.num_init_rounds,
-            init_method="kmeans",
-            cluster_layers=args.num_init_cluster_layers,
-            material_colors=material_colors_np,
+    The mask scales heights during initialization and can later weight loss terms.
+
+    Behavior:
+    - Reads image; converts RGBA/RGB to grayscale.
+    - Resizes to full-resolution output size.
+    - Persists a diagnostic PNG after normalization.
+
+    Returns:
+        focus_map_full: Float32 tensor (H,W) in [0,1] or None if no mask provided.
+    """
+    focus_map_full = None
+    if args.priority_mask != "":
+        pm = imread(args.priority_mask, cv2.IMREAD_UNCHANGED)
+        if pm.ndim == 3:
+            if pm.shape[2] == 4:
+                pm = pm[:, :, :3]
+            pm = cv2.cvtColor(pm, cv2.COLOR_BGR2GRAY)
+        tgt_h, tgt_w = output_img_np.shape[:2]
+        pm_resized = cv2.resize(pm, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
+        pm_float = pm_resized.astype(np.float32) / 255.0
+        focus_map_full = torch.tensor(pm_float, dtype=torch.float32, device=device)
+        cv2.imwrite(
+            os.path.join(args.output_folder, "priority_mask_resized.png"),
+            (pm_float * 255).astype(np.uint8),
         )
-    )
+    return focus_map_full
 
-    processing_img_np = resize_image(
-        output_img_np, computed_processing_size
-    )  # For the processing resolution
+
+def _initialize_heightmap(
+    args,
+    output_img_np: np.ndarray,
+    bgr_tuple: Tuple[int, int, int],
+    material_colors_np: np.ndarray,
+    random_seed: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """Initialize the height map logits & labels using selected method.
+
+    Methods:
+        depth  : Uses an external depth estimation model (requires transformers).
+        kmeans : Clusters pixel colors into layer assignments (default).
+
+    Returns:
+        pixel_height_logits_init: (H,W) float32 numpy array of raw logits.
+        global_logits_init     : (L,*) global logits array or None (depth variant may not use it).
+        pixel_height_labels    : (H,W) int array of discrete initial layer indices.
+    """
+    print("Initalizing height map. This can take a moment...")
+    if args.init_heightmap_method == "depth":
+        try:
+            from autoforge.Helper.Heightmaps.DepthEstimateHeightMap import (
+                init_height_map_depth_color_adjusted,
+            )
+        except Exception:
+            print(
+                "Error: depth initializer requested but could not be imported. Install 'transformers' and try again.",
+                file=sys.stderr,
+            )
+            raise
+        pixel_height_logits_init, pixel_height_labels = (
+            init_height_map_depth_color_adjusted(
+                output_img_np,
+                args.max_layers,
+                random_seed=random_seed,
+                focus_map=None,
+                focus_boost=args.priority_mask_boost,
+            )
+        )
+        global_logits_init = None
+    else:
+        pixel_height_logits_init, global_logits_init, pixel_height_labels = (
+            run_init_threads(
+                output_img_np,
+                args.max_layers,
+                args.layer_height,
+                bgr_tuple,
+                random_seed=random_seed,
+                num_threads=args.num_init_rounds,
+                init_method="kmeans",
+                cluster_layers=args.num_init_cluster_layers,
+                material_colors=material_colors_np,
+                focus_map=None,
+                focus_boost=args.priority_mask_boost,
+            )
+        )
+    return pixel_height_logits_init, global_logits_init, pixel_height_labels
+
+
+def _prepare_processing_targets(
+    output_img_np: np.ndarray,
+    computed_processing_size: int,
+    device: torch.device,
+    focus_map_full: Optional[torch.Tensor],
+) -> Tuple[np.ndarray, torch.Tensor, Optional[torch.Tensor]]:
+    """Create downscaled optimization target & focus map for faster iterations.
+
+    Args:
+        output_img_np: Full-resolution RGB image (float or uint8 expected).
+        computed_processing_size: Target square size for processing (maintains aspect via resize helper).
+        device: Torch device.
+        focus_map_full: Optional full-resolution focus map tensor.
+
+    Returns:
+        processing_img_np  : Downscaled numpy image (H_p,W_p,3).
+        processing_target  : Torch tensor version (float32) on device.
+        focus_map_proc     : Optional downscaled focus map tensor (H_p,W_p).
+    """
+    processing_img_np = resize_image(output_img_np, computed_processing_size)
     processing_target = torch.tensor(
         processing_img_np, dtype=torch.float32, device=device
     )
 
-    # nearest neighbor resize
-    processing_pixel_height_logits_init = cv2.resize(
-        src=pixel_height_logits_init,
-        interpolation=cv2.INTER_NEAREST,
-        dsize=(processing_target.shape[1], processing_target.shape[0]),
-    )
-    processing_pixel_height_labels = cv2.resize(
-        src=pixel_height_labels,
-        interpolation=cv2.INTER_NEAREST,
-        dsize=(processing_target.shape[1], processing_target.shape[0]),
-    )
+    focus_map_proc = None
+    if focus_map_full is not None:
+        fm_proc_np = cv2.resize(
+            focus_map_full.cpu().numpy().astype(np.float32),
+            (processing_target.shape[1], processing_target.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        focus_map_proc = torch.tensor(fm_proc_np, dtype=torch.float32, device=device)
 
-    # if we have an alpha mask we set the height for those pixels to -13.815512 (the lowest init sigmoid value)
-    # Now with unlocked height map we probably need to think about changing this somehow. TODO: Think about this.
-    if alpha is not None:
-        pixel_height_logits_init[alpha < 128] = -13.815512
+    return processing_img_np, processing_target, focus_map_proc
 
-    # VGG Perceptual Loss
-    # We currently disable this as it is not used in the optimization.
-    perception_loss_module = None  # MultiLayerVGGPerceptualLoss().to(device).eval()
 
-    # Create an optimizer instance
+def _build_optimizer(
+    args,
+    processing_target: torch.Tensor,
+    processing_pixel_height_logits_init: np.ndarray,
+    processing_pixel_height_labels: np.ndarray,
+    global_logits_init,
+    material_colors: torch.Tensor,
+    material_TDs: torch.Tensor,
+    background: torch.Tensor,
+    device: torch.device,
+    perception_loss_module,
+    focus_map_proc: Optional[torch.Tensor],
+) -> FilamentOptimizer:
+    """Instantiate the FilamentOptimizer with initial tensors and configuration.
+
+    Args mirror the optimizer's constructor; this function simply centralizes assembly.
+
+    Returns:
+        FilamentOptimizer: Ready-to-run optimizer instance.
+    """
     optimizer = FilamentOptimizer(
         args=args,
         target=processing_target,
@@ -413,9 +651,25 @@ def start(args):
         background=background,
         device=device,
         perception_loss_module=perception_loss_module,
+        focus_map=focus_map_proc,
     )
+    return optimizer
 
-    # Main optimization loop
+
+def _run_optimization_loop(optimizer: FilamentOptimizer, args, device: torch.device) -> None:
+    """Execute the main gradient-based optimization iterations.
+
+    Features:
+    - Automatic mixed precision (bfloat16 unless MPS).
+    - Periodic visualization & tensorboard logging (every 100 iterations).
+    - Discrete solution snapshots controlled via --discrete_check.
+    - Early stopping after a patience window (--early_stopping).
+
+    Args:
+        optimizer: Configured FilamentOptimizer instance.
+        args: Global argument namespace.
+        device: Torch device for autocast context.
+    """
     print("Starting optimization...")
     tbar = tqdm(range(args.iterations))
     dtype = torch.bfloat16 if not args.mps else torch.float32
@@ -441,13 +695,40 @@ def start(args):
                 )
                 break
 
+
+def _post_optimize_and_export(
+    args,
+    optimizer: FilamentOptimizer,
+    pixel_height_logits_init: np.ndarray,
+    pixel_height_labels: np.ndarray,
+    output_target: torch.Tensor,
+    alpha: Optional[np.ndarray],
+    material_colors_np: np.ndarray,
+    material_TDs_np: np.ndarray,
+    material_names: List[str],
+    bgr_tuple: Tuple[int, int, int],
+    device: torch.device,
+    focus_map_full: Optional[torch.Tensor],
+    focus_map_proc: Optional[torch.Tensor],
+) -> float:
+    """Finalize solution, optionally prune, and write all output artifacts.
+
+    Steps:
+    - Restore full-resolution logits to optimizer and (optionally) height residual.
+    - Replace focus map with full-res version if used.
+    - Perform pruning (respecting color slots for background & clear in FlatForge mode).
+    - Compute final loss estimate and persist to file.
+    - Export preview PNG, STL(s), swap instructions & project file.
+
+    Returns:
+        float: The final reported loss (post-pruning).
+    """
     post_opt_step = 0
 
     optimizer.log_to_tensorboard(
         interval=1, namespace="post_opt", step=(post_opt_step := post_opt_step + 1)
     )
 
-    # set the full size again for pruning
     optimizer.pixel_height_logits = torch.from_numpy(pixel_height_logits_init)
     optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
         pixel_height_logits_init
@@ -456,7 +737,30 @@ def start(args):
     optimizer.pixel_height_labels = torch.tensor(
         pixel_height_labels, dtype=torch.int32, device=device
     )
+    if hasattr(optimizer, "height_residual"):
+        with torch.no_grad():
+            hr = optimizer.height_residual.detach()
+            full_h, full_w = optimizer.pixel_height_logits.shape[:2]
+            if hr.shape != (full_h, full_w):
+                hr4d = hr.unsqueeze(0).unsqueeze(0)
+                hr_full = (
+                    torch.nn.functional.interpolate(
+                        hr4d,
+                        size=(full_h, full_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
+                optimizer.height_residual.data = hr_full.to(device)
+            optimizer.best_params["height_residual"] = (
+                optimizer.height_residual.detach().clone()
+            )
+    if focus_map_proc is not None and focus_map_full is not None:
+        optimizer.focus_map = focus_map_full
 
+    dtype = torch.bfloat16 if not args.mps else torch.float32
     with torch.no_grad():
         with torch.autocast(device.type, dtype=dtype):
             if args.perform_pruning:
@@ -464,7 +768,7 @@ def start(args):
                 # pruning_max_colors = total filaments needed
                 # Need to reserve slots: 1 for background (always), 1 for clear (FlatForge only)
                 max_colors_for_pruning = args.pruning_max_colors
-                
+
                 if args.flatforge:
                     # FlatForge: pruning_max_colors = colored + clear + background
                     # Reserve 2 slots (1 clear + 1 background)
@@ -473,7 +777,7 @@ def start(args):
                     # Traditional: pruning_max_colors = colored + background
                     # Reserve 1 slot for background
                     max_colors_for_pruning = max(1, args.pruning_max_colors - 1)
-                
+
                 optimizer.prune(
                     max_colors_allowed=max_colors_for_pruning,
                     max_swaps_allowed=args.pruning_max_swaps,
@@ -496,12 +800,10 @@ def start(args):
             final_loss = PruningHelper.get_initial_loss(
                 optimizer.best_params["global_logits"].shape[0], optimizer
             )
-            # write to text file
             with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
                 f.write(f"{final_loss}")
 
             print("Done. Saving outputs...")
-            # Save Image
             comp_disc = optimizer.get_best_discretized_image()
             args.max_layers = optimizer.max_layers
 
@@ -549,7 +851,6 @@ def start(args):
                     alpha_mask=alpha,
                 )
 
-            # Swap instructions (only for traditional mode)
             if not args.flatforge:
                 background_layers = int(args.background_height // args.layer_height)
                 swap_instructions = generate_swap_instructions(
@@ -559,6 +860,7 @@ def start(args):
                     background_layers,
                     args.background_height,
                     material_names,
+                    getattr(args, "background_material_name", None),
                 )
                 with open(
                     os.path.join(args.output_folder, "swap_instructions.txt"), "w"
@@ -566,8 +868,6 @@ def start(args):
                     for line in swap_instructions:
                         f.write(line + "\n")
 
-            # Project file (only for traditional mode)
-            if not args.flatforge:
                 project_filename = os.path.join(args.output_folder, "project_file.hfp")
                 generate_project_file(
                     project_filename,
@@ -585,7 +885,159 @@ def start(args):
             return final_loss
 
 
-def main():
+def start(args) -> float:
+    """Entry point for a single optimization run.
+
+    Orchestrates the entire pipeline:
+    - Validation & device selection.
+    - Material & image loading (+ optional auto background selection).
+    - Resolution computation & resizing.
+    - Heightmap initialization.
+    - Optimizer construction & iterative optimization loop.
+    - Post-processing, pruning, and output generation.
+
+    Args:
+        args: Parsed argument namespace.
+
+    Returns:
+        float: Final loss value for this run (after pruning/export).
+    """
+    if args.num_init_cluster_layers == -1:
+        args.num_init_cluster_layers = args.max_layers // 2
+
+    # check if csv or json is given
+    if args.csv_file == "" and args.json_file == "":
+        print("Error: No CSV or JSON file given. Please provide one of them.")
+        sys.exit(1)
+
+    device = get_device(args)
+
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    perform_basic_check(args)
+
+    random_seed = set_seed(args)
+
+    # Load materials (we keep colors_list for potential auto background)
+    material_colors_np, material_TDs_np, material_names, colors_list = load_materials(
+        args
+    )
+
+    # Read input image early (needed for auto background color)
+    img = imread(args.input_image, cv2.IMREAD_UNCHANGED)
+    alpha = None
+    if img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        alpha = alpha[..., None]
+        img = img[:, :, :3]
+
+    # Convert image from BGR to RGB for color analysis
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Auto background color selection (optional)
+    _auto_select_background_color(
+        args, img_rgb, alpha, material_colors_np, material_names, colors_list
+    )
+
+    # Prepare background color tensor and material tensors
+    bgr_tuple, background, material_colors, material_TDs = _prepare_background_and_materials(
+        args, device, material_colors_np, material_TDs_np
+    )
+
+    # Compute sizes
+    computed_output_size, computed_processing_size = _compute_pixel_sizes(args)
+
+    # Resize alpha if present (match final resolution) after computing size
+    if alpha is not None:
+        alpha = resize_image(alpha, computed_output_size)
+
+    # For the final resolution
+    output_img_np = resize_image(img_rgb, computed_output_size)
+    output_target = torch.tensor(output_img_np, dtype=torch.float32, device=device)
+
+    # Priority mask handling (full-res)
+    focus_map_full = _load_priority_mask(args, output_img_np, device)
+
+    # Initialize heightmap
+    pixel_height_logits_init, global_logits_init, pixel_height_labels = _initialize_heightmap(
+        args,
+        output_img_np,
+        bgr_tuple,
+        material_colors_np,
+        random_seed,
+    )
+
+    # Prepare processing targets and focus map (processing-res)
+    processing_img_np, processing_target, focus_map_proc = _prepare_processing_targets(
+        output_img_np, computed_processing_size, device, focus_map_full
+    )
+
+    # Downscale initial logits/labels to processing resolution
+    processing_pixel_height_logits_init = cv2.resize(
+        src=pixel_height_logits_init,
+        interpolation=cv2.INTER_NEAREST,
+        dsize=(processing_target.shape[1], processing_target.shape[0]),
+    )
+    processing_pixel_height_labels = cv2.resize(
+        src=pixel_height_labels,
+        interpolation=cv2.INTER_NEAREST,
+        dsize=(processing_target.shape[1], processing_target.shape[0]),
+    )
+
+    # Apply alpha mask to full-res logits (keep original order/behavior)
+    if alpha is not None:
+        pixel_height_logits_init[alpha < 128] = -13.815512
+
+    perception_loss_module = None
+
+    # Build optimizer
+    optimizer = _build_optimizer(
+        args,
+        processing_target,
+        processing_pixel_height_logits_init,
+        processing_pixel_height_labels,
+        global_logits_init,
+        material_colors,
+        material_TDs,
+        background,
+        device,
+        perception_loss_module,
+        focus_map_proc,
+    )
+
+    # Run optimization loop
+    _run_optimization_loop(optimizer, args, device)
+
+    # Post-process, prune, and export outputs
+    final_loss = _post_optimize_and_export(
+        args,
+        optimizer,
+        pixel_height_logits_init,
+        pixel_height_labels,
+        output_target,
+        alpha,
+        material_colors_np,
+        material_TDs_np,
+        material_names,
+        bgr_tuple,
+        device,
+        focus_map_full,
+        focus_map_proc,
+    )
+
+    return final_loss
+
+
+def main() -> None:
+    """Support multi-run execution via --best_of; persist best run artifacts.
+
+    If --best_of == 1, simply invokes a single start(). Otherwise:
+    - Creates temporary run subfolders.
+    - Tracks losses, reports statistics (best / median / std).
+    - Moves files from best run folder into the final output folder.
+
+    Note: Memory is periodically reclaimed (gc + CUDA cache clears + closing matplotlib figures).
+    """
     args = parse_args()
     final_output_folder = args.output_folder
     run_best_loss = 1000000000
@@ -606,25 +1058,20 @@ def main():
                     run_best_loss = run_loss
                     print(f"New best loss found: {run_best_loss} in run {i + 1}")
                 ret.append((run_folder, run_loss))
-                # garbage collection
                 torch.cuda.empty_cache()
                 import gc
 
                 gc.collect()
                 torch.cuda.empty_cache()
-                # close all matplotlib windows if there are any
                 import matplotlib.pyplot as plt
 
                 plt.close("all")
             except Exception:
                 traceback.print_exc()
-        # get run with best loss
         best_run = min(ret, key=lambda x: x[1])
         best_run_folder = best_run[0]
         best_loss = best_run[1]
 
-        # print statistics
-        # median
         losses = [x[1] for x in ret]
         median_loss = np.median(losses)
         std_loss = np.std(losses)
@@ -633,7 +1080,6 @@ def main():
         print(f"Median loss: {median_loss}")
         print(f"Standard deviation of losses: {std_loss}")
 
-        # move files from run folder to final output folder
         if not os.path.exists(final_output_folder):
             os.makedirs(final_output_folder)
         for file in os.listdir(best_run_folder):

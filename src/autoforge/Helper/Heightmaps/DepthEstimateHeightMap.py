@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -6,7 +7,6 @@ from sklearn.cluster import KMeans
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import silhouette_score
 from sklearn.utils._testing import ignore_warnings
-from transformers import pipeline
 
 
 def initialize_pixel_height_logits(target):
@@ -46,6 +46,8 @@ def init_height_map_depth_color_adjusted(
     w_depth=0.5,
     w_lum=0.5,
     order_blend=0.1,
+    focus_map: Optional[np.ndarray] = None,
+    focus_boost: float = 0.5,
 ):
     """
     Initialize pixel height logits by combining depth and color information while allowing a blend
@@ -75,14 +77,24 @@ def init_height_map_depth_color_adjusted(
         w_depth (float): Weight for depth difference in ordering_depth.
         w_lum (float): Weight for luminance difference in ordering_depth.
         order_blend (float): Slider (0 to 1) blending original luminance ordering (0) and depth-informed ordering (1).
+        focus_map (np.ndarray | None): Optional focus map to boost height values in certain regions.
+        focus_boost (float): Scaling factor for the focus map.
 
     Returns:
-        np.ndarray: Pixel height logits (H, W).
+        tuple[np.ndarray, np.ndarray]: Pixel height logits (H, W) and the final integer label map (H, W).
     """
 
     # ---------------------------
     # Step 1: Obtain normalized depth map using Depth Anything v2
     # ---------------------------
+    # Local import to avoid making transformers a hard dependency unless this init is used.
+    try:
+        from transformers import pipeline  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "Depth initializer requires 'transformers' installed. Install transformers to use --init_heightmap_method depth."
+        ) from e
+
     target_uint8 = target.astype(np.uint8)
     image_pil = Image.fromarray(target_uint8)
     pipe = pipeline(
@@ -93,6 +105,17 @@ def init_height_map_depth_color_adjusted(
     if hasattr(depth_map, "convert"):
         depth_map = np.array(depth_map)
     depth_map = depth_map.astype(np.float32)
+    # Ensure depth map matches input size
+    if depth_map.shape[:2] != (target.shape[0], target.shape[1]):
+        from PIL import Image as _Image
+
+        Resampling = getattr(_Image, "Resampling", None)
+        resample = Resampling.BILINEAR if Resampling is not None else _Image.BILINEAR
+        depth_map = np.array(
+            _Image.fromarray(depth_map).resize(
+                (target.shape[1], target.shape[0]), resample
+            )
+        )
     depth_min = depth_map.min()
     depth_max = depth_map.max()
     depth_norm = (depth_map - depth_min) / (depth_max - depth_min + eps)
@@ -103,31 +126,14 @@ def init_height_map_depth_color_adjusted(
     H, W, _ = target.shape
     pixels = target.reshape(-1, 3).astype(np.float32)
 
-    def find_best_n_clusters(pixels, max_layers, random_seed):
-        sample_size = 1000
-        if pixels.shape[0] > sample_size:
-            indices = np.random.choice(pixels.shape[0], sample_size, replace=False)
-            sample_pixels = pixels[indices]
-        else:
-            sample_pixels = pixels
-        best_n = None
-        best_score = -np.inf
-        for n in range(2, max_layers + 1):
-            kmeans_temp = KMeans(n_clusters=n, random_state=random_seed)
-            labels_temp = kmeans_temp.fit_predict(sample_pixels)
-            score = silhouette_score(sample_pixels, labels_temp)
-            if score > best_score:
-                best_score = score
-                best_n = n
-        return best_n
-
-    optimal_n = find_best_n_clusters(pixels, max_layers, random_seed)
-    print(f"Optimal number of clusters: {optimal_n}")
+    optimal_n = max_layers  # // 2
     # ---------------------------
     # Step 3: Perform color clustering on the full image
     # ---------------------------
-    kmeans = KMeans(n_clusters=optimal_n, random_state=random_seed).fit(pixels)
-    labels = kmeans.labels_.reshape(H, W)
+    # kmeans = KMeans(n_clusters=optimal_n, random_state=random_seed).fit(pixels)
+    # labels = kmeans.labels_.reshape(H, W)
+    labels = KMeans(n_clusters=optimal_n, random_state=random_seed).fit_predict(pixels)
+    labels = labels.reshape(H, W)
 
     # ---------------------------
     # Step 4: Adjust clusters based on depth (split clusters with high depth spread)
@@ -289,8 +295,21 @@ def init_height_map_depth_color_adjusted(
     )
     if new_labels.max() > 0:
         new_labels = new_labels / new_labels.max()
+    if focus_map is not None:
+        fm = np.asarray(focus_map, dtype=np.float32)
+        if fm.max() > 1.0 or fm.min() < 0.0:
+            fm = np.clip(fm, 0, 255) / 255.0
+        if fm.shape != new_labels.shape:
+            H, W = new_labels.shape
+            src_h, src_w = fm.shape[:2]
+            iy = (np.arange(H) * src_h / H).astype(np.int32)
+            ix = (np.arange(W) * src_w / W).astype(np.int32)
+            iy = np.clip(iy, 0, src_h - 1)
+            ix = np.clip(ix, 0, src_w - 1)
+            fm = fm[np.ix_(iy, ix)]
+        new_labels = np.clip(new_labels * (1.0 + focus_boost * fm), 0.0, 1.0)
     pixel_height_logits = np.log((new_labels + eps) / (1 - new_labels + eps))
-    return pixel_height_logits
+    return pixel_height_logits, final_labels.astype(np.int32)
 
 
 def tsp_simulated_annealing(
@@ -378,8 +397,9 @@ def choose_optimal_num_bands(centroids, min_bands=2, max_bands=15, random_seed=N
     best_score = -1
 
     for num in range(min_bands, max_bands + 1):
-        kmeans = KMeans(n_clusters=num, random_state=random_seed).fit(centroids)
-        labels = kmeans.labels_
+        # kmeans = KMeans(n_clusters=num, random_state=random_seed).fit(centroids)
+        # labels = kmeans.labels_
+        labels = KMeans(n_clusters=num, random_state=random_seed).fit_predict(centroids)
         # If there's only one unique label, skip to avoid errors.
         if len(np.unique(labels)) < 2:
             continue
