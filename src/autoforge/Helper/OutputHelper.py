@@ -638,16 +638,18 @@ def generate_flatforge_stls(
                     highest_color_layer = layer
                     break
             
-            # If there's room above the highest colored layer, fill it with clear
-            if highest_color_layer < max_layer - 1:
-                has_clear = True
-                # Clear starts right after the highest color layer (or from 0 if no colors)
-                clear_min_height_map[i, j] = highest_color_layer + 1
-                clear_height_map[i, j] = max_layer
-            elif highest_color_layer == -1 and max_layer > 0:
-                # No colored layers at all at this pixel, fill entire height with clear
+            # Clear fills in two cases:
+            # 1. No colored layers at this pixel (background only) -> clear from 0 to max_layer
+            # 2. Has colored layers but highest is below max_layer -> clear ABOVE highest color
+            if highest_color_layer == -1:
+                # No colored layers - pixel relies on background color, fill entirely with clear
                 has_clear = True
                 clear_min_height_map[i, j] = 0
+                clear_height_map[i, j] = max_layer
+            elif highest_color_layer < max_layer - 1:
+                # Has colored layers - clear only fills ABOVE the highest colored layer
+                has_clear = True
+                clear_min_height_map[i, j] = highest_color_layer + 1
                 clear_height_map[i, j] = max_layer
     
     if has_clear:
