@@ -343,6 +343,9 @@ def find_color_bands(dg: torch.Tensor):
     Return a list of (start_idx, end_idx, color_id) for each contiguous band
     in 'dg'. Example: if dg = [0,0,1,1,1,2,2], we get:
        [(0,1,0), (2,4,1), (5,6,2)]
+    
+    Note: Clear material (-1) bands are excluded from the list since they don't
+    count as swaps in flatforge mode.
     """
     bands = []
     dg_cpu = dg.detach().cpu().numpy()
@@ -352,11 +355,14 @@ def find_color_bands(dg: torch.Tensor):
 
     for i in range(1, n):
         if dg_cpu[i] != current_color:
-            bands.append((start_idx, i - 1, current_color))
+            # Only add non-clear bands
+            if current_color != -1:
+                bands.append((start_idx, i - 1, current_color))
             start_idx = i
             current_color = dg_cpu[i]
-    # finish last band
-    bands.append((start_idx, n - 1, current_color))
+    # finish last band (only if it's not clear)
+    if current_color != -1:
+        bands.append((start_idx, n - 1, current_color))
 
     return bands
 

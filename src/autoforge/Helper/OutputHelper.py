@@ -16,6 +16,9 @@ def extract_filament_swaps(disc_global, disc_height_image, background_layers):
     Given the discrete global material assignment (disc_global) and the discrete height image,
     extract the list of material indices (one per swap point) and the corresponding slider
     values (which indicate at which layer the material change occurs).
+    
+    Note: Transitions to/from clear material (-1) are NOT counted as swaps since clear
+    is printed as a separate piece in flatforge mode.
 
     Args:
         disc_global (jnp.ndarray): Discrete global material assignments.
@@ -32,15 +35,34 @@ def extract_filament_swaps(disc_global, disc_height_image, background_layers):
     if L == 0:
         return [], []
 
-    filament_indices = [int(disc_global[0])]  # first colour used
-    slider_values = [1]  # first swap happens at layer #2
+    # Find first non-clear material
+    first_material = int(disc_global[0])
+    start_idx = 0
+    if first_material == -1:
+        # Skip initial clear layers
+        for i in range(L):
+            if int(disc_global[i]) != -1:
+                first_material = int(disc_global[i])
+                start_idx = i
+                break
+        else:
+            # All layers are clear, no swaps
+            return [], []
+    
+    filament_indices = [first_material]  # first colour used
+    slider_values = [start_idx + 1]  # first swap happens at this layer
 
-    prev = int(disc_global[0])
-    for i in range(1, L):
+    prev = first_material
+    for i in range(start_idx + 1, L):
         current = int(disc_global[i])
-        if current != prev:
+        # Only count as a swap if both prev and current are non-clear materials
+        # and they're different from each other
+        if current != prev and current != -1 and prev != -1:
             filament_indices.append(current)  # new material
             slider_values.append(i + 1)  # 1-based index
+            prev = current
+        elif current != -1:
+            # Update prev if current is a colored material (but don't count -1 as prev)
             prev = current
 
     filament_indices.append(prev)
