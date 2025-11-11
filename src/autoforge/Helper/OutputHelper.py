@@ -575,9 +575,33 @@ def generate_flatforge_stls(
     
     stl_files = []
     
+    # Convert background color hex to RGB for comparison
+    bg_hex_clean = background_color_hex.lstrip('#')
+    bg_r = int(bg_hex_clean[0:2], 16) / 255.0
+    bg_g = int(bg_hex_clean[2:4], 16) / 255.0
+    bg_b = int(bg_hex_clean[4:6], 16) / 255.0
+    background_rgb = np.array([bg_r, bg_g, bg_b])
+    
+    # Check if background color matches any material color
+    background_material_idx = None
+    color_tolerance = 0.01  # Allow small tolerance for floating point comparison
+    for mat_idx in unique_materials:
+        material_rgb = material_colors_np[mat_idx]
+        if np.allclose(material_rgb, background_rgb, atol=color_tolerance):
+            background_material_idx = mat_idx
+            print(f"Background color matches material: {material_names[mat_idx]}")
+            break
+    
     # Helper function to create a flat box STL for a given material at specific layers
-    def create_color_stl(material_idx, material_name, color_hex):
-        """Create an STL for a specific material/color."""
+    def create_color_stl(material_idx, material_name, color_hex, include_background=False):
+        """Create an STL for a specific material/color.
+        
+        Args:
+            material_idx: Index of the material.
+            material_name: Name of the material.
+            color_hex: Hex color string.
+            include_background: If True, extend this material down to z=0 (include background layer).
+        """
         # Find which layers and pixels use this material
         material_mask_3d = (layer_materials == material_idx)
         
@@ -599,6 +623,21 @@ def generate_flatforge_stls(
                         if layer < min_height_map[i, j]:
                             min_height_map[i, j] = layer
         
+        if not has_material and not include_background:
+            return None
+        
+        # If including background, extend all valid pixels down to z=0
+        if include_background:
+            for i in range(H):
+                for j in range(W):
+                    if valid_mask[i, j]:
+                        has_material = True
+                        # Extend the material down to the background (layer 0 = height 0)
+                        min_height_map[i, j] = 0
+                        # If this pixel doesn't have any layers yet, set it to background_height
+                        if height_map[i, j] == 0:
+                            height_map[i, j] = 0  # Will be set to background_height in mm below
+        
         if not has_material:
             return None
         
@@ -606,8 +645,15 @@ def generate_flatforge_stls(
         height_map_mm = height_map * layer_height
         min_height_map_mm = min_height_map * layer_height
         
-        # Create a 2D mask indicating which pixels have this material (at any layer)
-        material_mask_2d = np.any(material_mask_3d, axis=0)
+        # If including background, ensure all pixels extend down to 0
+        if include_background:
+            min_height_map_mm[:] = 0  # Background starts at z=0
+        
+        # Create a 2D mask indicating which pixels have this material (at any layer or background)
+        if include_background:
+            material_mask_2d = valid_mask.copy()  # All valid pixels get this material
+        else:
+            material_mask_2d = np.any(material_mask_3d, axis=0)
         
         # Create vertices for the box
         # We need to create a rectangular box where z goes from min to max for each pixel
@@ -634,18 +680,23 @@ def generate_flatforge_stls(
             int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
         )
         
-        print(f"Generating FlatForge STL for {material_name}...")
-        create_color_stl(mat_idx, material_name, color_hex)
+        # If this material matches the background color, include the background layer
+        include_bg = (background_material_idx == mat_idx)
+        if include_bg:
+            print(f"Generating FlatForge STL for {material_name} (including background)...")
+        else:
+            print(f"Generating FlatForge STL for {material_name}...")
+        create_color_stl(mat_idx, material_name, color_hex, include_background=include_bg)
     
-    # Generate STL for clear/transparent areas
+    # Generate STL for clear/transparent areas (including cap layers if requested)
     # Clear should fill the space from the TOP colored layer (per pixel) up to max_layer
-    # This creates a flat top surface at max_layer height
-    # Note: Any gaps WITHIN the colored layers (if disc_global has -1) are left as voids
-    print("Generating FlatForge STL for clear areas...")
+    # If cap_layers > 0, extend the clear material to include the cap layers
+    # This combines clear fill and cap into a single STL file
+    print("Generating FlatForge STL for clear/transparent areas...")
     
     # Find the highest colored layer for each pixel
     clear_height_map = np.zeros((H, W), dtype=float)
-    clear_min_height_map = np.full((H, W), max_layer, dtype=float)
+    clear_min_height_map = np.full((H, W), max_layer + cap_layers, dtype=float)
     
     has_clear = False
     for i in range(H):
@@ -661,18 +712,37 @@ def generate_flatforge_stls(
                     break
             
             # Clear fills in two cases:
-            # 1. No colored layers at this pixel (background only) -> clear from 0 to max_layer
-            # 2. Has colored layers but highest is below max_layer -> clear ABOVE highest color
+            # 1. No colored layers at this pixel (background only) -> clear from 0 to max_layer + cap_layers
+            # 2. Has colored layers but highest is below max_layer -> clear ABOVE highest color to max_layer + cap_layers
             if highest_color_layer == -1:
                 # No colored layers - pixel relies on background color, fill entirely with clear
                 has_clear = True
                 clear_min_height_map[i, j] = 0
-                clear_height_map[i, j] = max_layer
-            elif highest_color_layer < max_layer - 1:
-                # Has colored layers - clear only fills ABOVE the highest colored layer
+                clear_height_map[i, j] = max_layer + cap_layers
+            elif highest_color_layer < max_layer - 1 + cap_layers:
+                # Has colored layers - clear fills ABOVE the highest colored layer
+                # If cap_layers > 0, this extends all the way to max_layer + cap_layers
                 has_clear = True
                 clear_min_height_map[i, j] = highest_color_layer + 1
-                clear_height_map[i, j] = max_layer
+                clear_height_map[i, j] = max_layer + cap_layers
+    
+    # If cap_layers > 0, ensure all valid pixels have clear extending to the cap height
+    # This creates a flat top surface across the entire print
+    if cap_layers > 0:
+        print(f"Including cap layer ({cap_layers} layers) in clear material...")
+        for i in range(H):
+            for j in range(W):
+                if not valid_mask[i, j]:
+                    continue
+                
+                # Ensure clear extends at least from max_layer to max_layer + cap_layers
+                # This covers the cap region for all pixels
+                if clear_height_map[i, j] < max_layer + cap_layers:
+                    has_clear = True
+                    # If this pixel already has some clear, extend it to include cap
+                    if clear_min_height_map[i, j] > max_layer:
+                        clear_min_height_map[i, j] = max_layer
+                    clear_height_map[i, j] = max_layer + cap_layers
     
     if has_clear:
         clear_height_map_mm = clear_height_map * layer_height
@@ -692,42 +762,24 @@ def generate_flatforge_stls(
     else:
         print("No clear areas needed - all layers filled with colored materials.")
     
-    # Generate cap layer if requested
-    if cap_layers > 0:
-        print(f"Generating FlatForge STL for cap layer ({cap_layers} layers)...")
-        # Cap layer covers the entire valid area at the top, creating a flat top surface
-        # The cap should be ONLY transparent filament with thickness = cap_layers * layer_height
-        # It starts at max_layer (above all other layers) and extends to max_layer + cap_layers
-        cap_height_map = np.full((H, W), (max_layer + cap_layers) * layer_height, dtype=float)
-        cap_min_height_map = np.full((H, W), max_layer * layer_height, dtype=float)
+    # Generate background STL only if background color doesn't match any material
+    if background_material_idx is None:
+        print("Generating FlatForge STL for background...")
+        # Background is a flat layer at the bottom covering the entire valid area
+        bg_height_map = np.full((H, W), background_height, dtype=float)
+        bg_min_height_map = np.zeros((H, W), dtype=float)
+        bg_mask = valid_mask
         
-        # Cap covers all valid pixels to ensure flat top
-        cap_mask = valid_mask
-        
-        filename = os.path.join(output_folder, f"Cap_{clear_material_name}_{clear_color_hex}.stl")
+        filename = os.path.join(output_folder, f"Background_{background_color_hex.lstrip('#')}.stl")
         mesh_data = _create_flatforge_box_mesh(
-            cap_height_map, cap_min_height_map, background_height,
-            maximum_x_y_size, valid_mask, cap_mask
+            bg_height_map, bg_min_height_map, 0.0,  # No additional offset for background
+            maximum_x_y_size, valid_mask, bg_mask
         )
         if mesh_data is not None:
             _save_stl_with_manifold_fix(mesh_data, filename)
             stl_files.append(filename)
-    
-    # Generate background STL
-    print("Generating FlatForge STL for background...")
-    # Background is a flat layer at the bottom covering the entire valid area
-    bg_height_map = np.full((H, W), background_height, dtype=float)
-    bg_min_height_map = np.zeros((H, W), dtype=float)
-    bg_mask = valid_mask
-    
-    filename = os.path.join(output_folder, f"Background_{background_color_hex.lstrip('#')}.stl")
-    mesh_data = _create_flatforge_box_mesh(
-        bg_height_map, bg_min_height_map, 0.0,  # No additional offset for background
-        maximum_x_y_size, valid_mask, bg_mask
-    )
-    if mesh_data is not None:
-        _save_stl_with_manifold_fix(mesh_data, filename)
-        stl_files.append(filename)
+    else:
+        print("Background already included in material STL (color match).")
     
     print(f"FlatForge mode: Generated {len(stl_files)} STL files.")
     return stl_files
