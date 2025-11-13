@@ -72,7 +72,7 @@ autoforge --input_image path/to/input_image.jpg --json_file %APPDATA%\HueForge\F
 > For Example: 8 colors and a maximum of 20 swaps:
 
 ```bash
-autoforge --input_image path/to/input_image.jpg --csv_file path/to/materials.csv --pruning_max_colors 8 --pruning_max_swaps 20
+autoforge --input_image path/to/input_image.jpg --csv_file path/to/materials.csv --pruning_max_materials 8 --pruning_max_swaps 20
 ```
 
 ### FlatForge Mode
@@ -105,8 +105,8 @@ This will generate separate STL files for each color, allowing you to print face
 - `--max_layers` Maximum number of layers (default: 75).  
   **Note:** This is about 3mm + the background height
 - `--min_layers`  Minimum number of layers (default: 0). Used to limit height of pruning.
-- `--background_height` Height of the background in millimeters (default: 0.24).  
-  **Note:** The background height must be divisible by the layer height.
+- `--background_height` Height of the background in millimeters (default: 1.0).  
+  **Note:** The background height must be divisible by the layer height. Higher values provide better structural support (1.0mm = 25 layers at 0.04mm).
 - `--background_color` Background color in hexadecimal format (default: `#000000` aka Black).  
   **Note:** The solver currently assumes that you have a solid color in the background, which means a color with a TD value of 4 or less (if you have a background height of 0.4).
 - `--visualize` enable live visualization of the composite image during optimization (default: True).
@@ -125,10 +125,10 @@ This will generate separate STL files for each color, allowing you to print face
   **Note:** This is highly recommended even if you don't have a color/color swap limit, as it actually increases the quality of the output.
 - `--fast_pruning`  Perform pruning in chunks. 10-15x speedup compared to accurate method (default: False).
 - `--fast_pruning_percent` Size of fast pruning chunks in percent (default: 0.5) (50%).
-- `--pruning_max_colors` Max number of colors allowed after pruning (default: 100).  
-  **Note:** This includes background in both modes. In FlatForge mode, also includes clear filament.
-  - Traditional: `--pruning_max_colors 4` means 3 colored + 1 background = 4 total filaments.
-  - FlatForge: `--pruning_max_colors 4` means 2 colored + 1 clear + 1 background = 4 total filaments.
+- `--pruning_max_materials` Max number of materials allowed after pruning (default: 100).  
+  **Note:** This is the total number of material filaments needed for the print.
+  - Traditional: `--pruning_max_materials 4` means up to 4 colored materials (background is separate).
+  - FlatForge: `--pruning_max_materials 4` means up to 4 materials total (colored + clear, background is separate).
 - `--pruning_max_swaps` Max number of swaps allowed after pruning (default: 100).
 - `--pruning_max_layer` Max number of layers allowed after pruning (default: 75).
 - `--random_seed` Random seed for reproducibility (default: 0 (disabled)).

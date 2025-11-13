@@ -62,8 +62,9 @@ def prune_num_colors(
     we stop after the first improving chunk, saving work.
     
     In FlatForge mode, the most transparent material (highest TD value) is treated
-    as the "clear" material and is not counted towards max_colors_allowed. This ensures
-    that when pruning_max_colors=4, you get: background + 2 colored + 1 clear = 4 total.
+    as the "clear" material and is protected from being merged with other materials.
+    The clear material IS counted in max_colors_allowed along with colored materials.
+    Background is not part of the pruning process (it's added during STL generation).
     """
     num_materials = optimizer.material_colors.shape[0]
     disc_global, _ = optimizer.get_discretized_solution(best=True)

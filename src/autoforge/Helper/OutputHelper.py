@@ -634,9 +634,11 @@ def generate_flatforge_stls(
                         has_material = True
                         # Extend the material down to the background (layer 0 = height 0)
                         min_height_map[i, j] = 0
-                        # If this pixel doesn't have any layers yet, set it to background_height
+                        # If this pixel doesn't have any layers yet, it should go to the background height
                         if height_map[i, j] == 0:
-                            height_map[i, j] = 0  # Will be set to background_height in mm below
+                            # Set to a fractional layer value that will equal background_height when converted
+                            # background_height / layer_height gives us the equivalent layer count
+                            height_map[i, j] = background_height / layer_height
         
         if not has_material:
             return None
@@ -645,9 +647,16 @@ def generate_flatforge_stls(
         height_map_mm = height_map * layer_height
         min_height_map_mm = min_height_map * layer_height
         
-        # If including background, ensure all pixels extend down to 0
+        # If including background, ensure all pixels extend down to 0 and use 0 offset
+        # since the heights are already in absolute coordinates (not relative to background)
         if include_background:
             min_height_map_mm[:] = 0  # Background starts at z=0
+            # Heights are already correct - colored layers are offset, background-only pixels 
+            # are at background_height
+            z_offset_to_use = 0.0
+        else:
+            # Normal colored material - needs to be offset above the background
+            z_offset_to_use = background_height
         
         # Create a 2D mask indicating which pixels have this material (at any layer or background)
         if include_background:
@@ -661,7 +670,7 @@ def generate_flatforge_stls(
         
         # Build mesh with per-pixel min and max heights
         mesh_data = _create_flatforge_box_mesh(
-            height_map_mm, min_height_map_mm, background_height, 
+            height_map_mm, min_height_map_mm, z_offset_to_use, 
             maximum_x_y_size, valid_mask, material_mask_2d
         )
         

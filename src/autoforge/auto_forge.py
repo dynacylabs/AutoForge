@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--background_height",
         type=float,
-        default=0.24,
+        default=1.0,
         help="Height of the background in mm",
     )
 
@@ -212,10 +212,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--pruning_max_colors",
+        "--pruning_max_materials",
         type=int,
         default=100,
-        help="Max number of colors allowed after pruning",
+        help="Max number of materials allowed after pruning",
     )
     parser.add_argument(
         "--pruning_max_swaps",
@@ -737,22 +737,15 @@ def _post_optimize_and_export(
     with torch.no_grad():
         with torch.autocast(device.type, dtype=dtype):
             if args.perform_pruning:
-                # Adjust pruning_max_colors to account for background and clear filament
-                # pruning_max_colors = total filaments needed
-                # Need to reserve slots: 1 for background (always), 1 for clear (FlatForge only)
-                max_colors_for_pruning = args.pruning_max_colors
-
-                if args.flatforge:
-                    # FlatForge: pruning_max_colors = colored + clear + background
-                    # Reserve 2 slots (1 clear + 1 background)
-                    max_colors_for_pruning = max(1, args.pruning_max_colors - 2)
-                else:
-                    # Traditional: pruning_max_colors = colored + background
-                    # Reserve 1 slot for background
-                    max_colors_for_pruning = max(1, args.pruning_max_colors - 1)
+                # pruning_max_materials = total materials in the print
+                # Background is not part of disc_global (it's added during STL generation)
+                # Clear and colored materials are both in disc_global and counted by pruning
+                # So we pass the user's value directly - it represents materials in disc_global
+                # Note: If background color matches a material, that material will include the background layer
+                max_materials_for_pruning = args.pruning_max_materials
 
                 optimizer.prune(
-                    max_colors_allowed=max_colors_for_pruning,
+                    max_colors_allowed=max_materials_for_pruning,
                     max_swaps_allowed=args.pruning_max_swaps,
                     min_layers_allowed=args.min_layers,
                     max_layers_allowed=args.pruning_max_layer,
