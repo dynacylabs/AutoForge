@@ -126,9 +126,9 @@ This will generate separate STL files for each color, allowing you to print face
 - `--fast_pruning`  Perform pruning in chunks. 10-15x speedup compared to accurate method (default: False).
 - `--fast_pruning_percent` Size of fast pruning chunks in percent (default: 0.5) (50%).
 - `--pruning_max_materials` Max number of materials allowed after pruning (default: 100).  
-  **Note:** This is the total number of material filaments needed for the print.
-  - Traditional: `--pruning_max_materials 4` means up to 4 colored materials (background is separate).
-  - FlatForge: `--pruning_max_materials 4` means up to 4 materials total (colored + clear, background is separate).
+  **Note:** This is the number of colored material filaments needed for the print.
+  - Traditional: `--pruning_max_materials 4` means up to 4 colored materials (background added separately).
+  - FlatForge: `--pruning_max_materials 4` means up to 4 colored materials (clear and background added separately).
 - `--pruning_max_swaps` Max number of swaps allowed after pruning (default: 100).
 - `--pruning_max_layer` Max number of layers allowed after pruning (default: 75).
 - `--random_seed` Random seed for reproducibility (default: 0 (disabled)).

@@ -151,9 +151,9 @@ def prune_num_colors(
         tbar.update(1)
 
         # Check if we've reached the target number of colors
-        # In FlatForge mode: total_mats includes clear, so we check total_mats <= max_colors_allowed
-        # In normal mode: total_mats == colored_mats, so same logic applies
-        if total_mats <= max_colors_allowed and not merge_pairs:
+        # In FlatForge mode: Use colored_mats (excludes clear) so clear doesn't count toward limit
+        # In normal mode: colored_mats == total_mats, so same logic applies
+        if colored_mats <= max_colors_allowed and not merge_pairs:
             break
         
         if not merge_pairs:
@@ -177,7 +177,7 @@ def prune_num_colors(
                 else:
                     # If we're over the limit, keep the best candidate even if it increases loss
                     total_mats, colored_mats = count_total_materials(best_dg)
-                    if total_mats > max_colors_allowed:
+                    if colored_mats > max_colors_allowed:
                         if merge_loss < c_loss:
                             c_cand = (merge_dg, merge_loss)
                             c_loss = merge_loss
@@ -200,7 +200,7 @@ def prune_num_colors(
             )(delayed(score_color)(best_dg, *pair) for pair in merge_pairs)
             merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
             total_mats, colored_mats = count_total_materials(best_dg)
-            if merge_loss < best_loss or total_mats > max_colors_allowed:
+            if merge_loss < best_loss or colored_mats > max_colors_allowed:
                 best_dg, best_loss = merge_dg, merge_loss
             else:
                 break
