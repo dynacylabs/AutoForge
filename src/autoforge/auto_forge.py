@@ -616,7 +616,8 @@ def _prepare_processing_targets(
     computed_processing_size: int,
     device: torch.device,
     focus_map_full: Optional[torch.Tensor],
-) -> Tuple[np.ndarray, torch.Tensor, Optional[torch.Tensor]]:
+    alpha_full: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Create downscaled optimization target & focus map for faster iterations.
 
     Args:
@@ -624,11 +625,13 @@ def _prepare_processing_targets(
         computed_processing_size: Target square size for processing (maintains aspect via resize helper).
         device: Torch device.
         focus_map_full: Optional full-resolution focus map tensor.
+        alpha_full: Optional full-resolution alpha mask (numpy array) in 0-255 range.
 
     Returns:
         processing_img_np  : Downscaled numpy image (H_p,W_p,3).
         processing_target  : Torch tensor version (float32) on device.
         focus_map_proc     : Optional downscaled focus map tensor (H_p,W_p).
+        alpha_proc         : Optional downscaled alpha mask tensor (float32) on device.
     """
     processing_img_np = resize_image(output_img_np, computed_processing_size)
     processing_target = torch.tensor(
@@ -644,7 +647,16 @@ def _prepare_processing_targets(
         )
         focus_map_proc = torch.tensor(fm_proc_np, dtype=torch.float32, device=device)
 
-    return processing_img_np, processing_target, focus_map_proc
+    alpha_proc = None
+    if alpha_full is not None:
+        alpha_proc_np = cv2.resize(
+            alpha_full.astype(np.float32),
+            (processing_target.shape[1], processing_target.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        alpha_proc = torch.tensor(alpha_proc_np, dtype=torch.float32, device=device)
+
+    return processing_img_np, processing_target, focus_map_proc, alpha_proc
 
 
 def _build_optimizer(
@@ -659,6 +671,7 @@ def _build_optimizer(
     device: torch.device,
     perception_loss_module,
     focus_map_proc: Optional[torch.Tensor],
+    alpha_proc: Optional[torch.Tensor] = None,
 ) -> FilamentOptimizer:
     """Instantiate the FilamentOptimizer with initial tensors and configuration.
 
@@ -679,6 +692,7 @@ def _build_optimizer(
         device=device,
         perception_loss_module=perception_loss_module,
         focus_map=focus_map_proc,
+        alpha=alpha_proc,
     )
     return optimizer
 
@@ -985,8 +999,9 @@ def start(args) -> float:
         pixel_height_logits_init[alpha < 128] = -13.815512
 
     # Prepare processing targets and focus map (processing-res)
-    processing_img_np, processing_target, focus_map_proc = _prepare_processing_targets(
-        output_img_np, computed_processing_size, device, focus_map_full
+    processing_img_np, processing_target, focus_map_proc, alpha_proc = _prepare_processing_targets(
+        output_img_np, computed_processing_size, device, focus_map_full,
+        alpha_full=alpha,
     )
 
     # Downscale initial logits/labels to processing resolution
@@ -1016,6 +1031,7 @@ def start(args) -> float:
         device,
         perception_loss_module,
         focus_map_proc,
+        alpha_proc=alpha_proc,
     )
 
     # Run optimization loop

@@ -35,6 +35,7 @@ class FilamentOptimizer:
         device: torch.device,
         perception_loss_module: Optional[torch.nn.Module],
         focus_map: Optional[torch.Tensor] = None,
+        alpha: Optional[torch.Tensor] = None,
         preview_callback=None,
         preview_callback_interval: int = 25,
     ):
@@ -51,6 +52,7 @@ class FilamentOptimizer:
             device (torch.device): Device to run the optimization on.
             perception_loss_module (torch.nn.Module): Module to compute perceptual loss.
             focus_map (torch.Tensor | None): Optional priority mask [H,W] in [0,1]. Higher -> higher loss weight.
+            alpha (torch.Tensor | None): Optional alpha mask [H,W] or [H,W,1] in 0-255. Pixels with alpha < 128 are masked out of loss.
         """
         self.args = args
         self.target = target  # smaller (solver) resolution, shape [H,W,3], float32
@@ -103,6 +105,11 @@ class FilamentOptimizer:
             if fm.dim() == 3 and fm.shape[-1] == 1:
                 fm = fm.squeeze(-1)
             self.focus_map = fm.to(device=self.device, dtype=torch.float32)
+
+        # Alpha mask for transparency
+        self.alpha = None
+        if alpha is not None:
+            self.alpha = alpha.to(device=self.device, dtype=torch.float32)
 
         self.preview_callback = preview_callback
         self.preview_callback_interval = preview_callback_interval
@@ -367,6 +374,7 @@ class FilamentOptimizer:
             background=self.background,
             add_penalty_loss=10.0,
             focus_map=self.focus_map,
+            alpha=self.alpha,
         )
 
         self.precision.backward_and_step(loss, self.optimizer)
@@ -904,6 +912,7 @@ class FilamentOptimizer:
                 comp=comp_disc,
                 target=self.target,
                 focus_map=self.focus_map,
+                alpha=self.alpha,
             ).item()
             from autoforge.Helper.PruningHelper import find_color_bands
 
@@ -954,6 +963,7 @@ class FilamentOptimizer:
                 comp=comp_disc,
                 target=self.target,
                 focus_map=self.focus_map,
+                alpha=self.alpha,
             ).item()
             if current_disc_loss < best_loss:
                 best_loss = current_disc_loss
