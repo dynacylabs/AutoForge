@@ -672,6 +672,7 @@ def _build_optimizer(
     perception_loss_module,
     focus_map_proc: Optional[torch.Tensor],
     alpha_proc: Optional[torch.Tensor] = None,
+    preview_callback=None,
 ) -> FilamentOptimizer:
     """Instantiate the FilamentOptimizer with initial tensors and configuration.
 
@@ -693,6 +694,7 @@ def _build_optimizer(
         perception_loss_module=perception_loss_module,
         focus_map=focus_map_proc,
         alpha=alpha_proc,
+        preview_callback=preview_callback,
     )
     return optimizer
 
@@ -908,7 +910,7 @@ def _post_optimize_and_export(
             return final_loss
 
 
-def start(args) -> float:
+def start(args, preview_callback=None) -> float:
     """Entry point for a single optimization run.
 
     Orchestrates the entire pipeline:
@@ -921,6 +923,9 @@ def start(args) -> float:
 
     Args:
         args: Parsed argument namespace.
+        preview_callback: Optional callable ``(optimizer, step_or_percent)`` invoked
+            periodically during optimization and pruning. The second argument is the
+            current step number during optimization and a 0-100 integer during pruning.
 
     Returns:
         float: Final loss value for this run (after pruning/export).
@@ -1032,6 +1037,7 @@ def start(args) -> float:
         perception_loss_module,
         focus_map_proc,
         alpha_proc=alpha_proc,
+        preview_callback=preview_callback,
     )
 
     # Run optimization loop

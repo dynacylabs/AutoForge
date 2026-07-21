@@ -15,7 +15,7 @@ dependencies = [
   "torch>=2.9.1",
   "torchvision>=0.21.0",
   "transformers>=4.48.1",
-  "opencv-python>=4.2.0.32",
+  "opencv-python-headless>=4.2.0.32",
   "matplotlib>=3.3.0",
   "configargparse>=1.2.3",
   "tqdm>=4.50.0",
@@ -38,8 +38,12 @@ dependencies = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+"autoforge.webui" = ["static/*", "static/**/*"]
+
 [project.scripts]
 autoforge = "autoforge.auto_forge:main"
+autoforge-webui = "autoforge.webui.server:main_cli"
 
 [tool.pytest.ini_options]
 addopts = ""

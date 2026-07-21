@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoForge Web UI</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #21262d;
+      --border:    #30363d;
+      --accent:    #238636;
+      --accent-h:  #2ea043;
+      --danger:    #da3633;
+      --warn:      #d29922;
+      --text:      #c9d1d9;
+      --text-dim:  #8b949e;
+      --blue:      #1f6feb;
+      --radius:    8px;
+      --font:      -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    html, body { height: 100%; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; }
+
+    /* ── Layout ───────────────────────────────────────────────────────── */
+    #app {
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      grid-template-columns: 380px 1fr;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+    header span { color: var(--text-dim); font-size: 13px; }
+    #sidebar {
+      overflow-y: auto;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+    #sidebar::-webkit-scrollbar { width: 6px; }
+    #sidebar::-webkit-scrollbar-track { background: transparent; }
+    #sidebar::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 3px;
+    }
+    #sidebar::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+    #main {
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      padding: 20px;
+    }
+
+    /* ── Sidebar form ─────────────────────────────────────────────────── */
+    .section {
+      border-bottom: 1px solid var(--border);
+    }
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      cursor: pointer;
+      user-select: none;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .3px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      background: var(--surface);
+      transition: background .15s;
+    }
+    .section-header:hover { background: var(--surface2); }
+    .section-header .chevron { transition: transform .2s; }
+    .section-body {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      padding: 14px 16px;
+    }
+    .section.open .section-body { display: flex; }
+    .section.open .chevron { transform: rotate(90deg); }
+
+    /* ── Form controls ────────────────────────────────────────────────── */
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 12px; color: var(--text-dim); font-weight: 500; }
+    .field input[type=text],
+    .field input[type=number],
+    .field select {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: var(--font);
+      outline: none;
+      transition: border-color .15s;
+    }
+    .field input[type=text]:focus,
+    .field input[type=number]:focus,
+    .field select:focus { border-color: var(--blue); }
+    .field input[type=color] {
+      width: 40px; height: 32px;
+      padding: 2px; border-radius: var(--radius);
+      border: 1px solid var(--border); cursor: pointer;
+      background: var(--surface2);
+    }
+    .field .row { display: flex; gap: 8px; align-items: center; }
+    .field .hint { font-size: 11px; color: var(--text-dim); }
+    .checkbox-field {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; cursor: pointer;
+    }
+    .checkbox-field input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
+
+    /* ── Drop zones ───────────────────────────────────────────────────── */
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 18px 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      background: var(--surface2);
+      position: relative;
+    }
+    .dropzone:hover, .dropzone.drag-over { border-color: var(--blue); background: #1f2a38; }
+    .dropzone input[type=file] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .dropzone .dz-icon { font-size: 28px; margin-bottom: 6px; }
+    .dropzone .dz-label { font-size: 12px; color: var(--text-dim); }
+    .dropzone .dz-name { font-size: 13px; font-weight: 600; margin-top: 4px; color: var(--blue); word-break: break-all; }
+
+    /* ── Submit / action buttons ──────────────────────────────────────── */
+    #sidebar-footer {
+      padding: 14px 16px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+    }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 8px 16px; border-radius: var(--radius); border: none;
+      font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s, background .15s;
+    }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-h); }
+    .btn-danger  { background: var(--danger); color: #fff; }
+    .btn-danger:hover:not(:disabled)  { background: #f85149; }
+    .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover:not(:disabled) { background: var(--border); }
+    #btn-run { flex: 1; }
+
+    /* ── Main panel ───────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--text-dim);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* ── Preview ──────────────────────────────────────────────────────── */
+    #preview-wrap {
+      min-height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      position: relative;
+    }
+    #preview-img {
+      max-width: 100%;
+      max-height: 460px;
+      display: none;
+      image-rendering: pixelated;
+    }
+    #preview-placeholder {
+      color: var(--text-dim);
+      font-size: 13px;
+      text-align: center;
+      padding: 20px;
+    }
+
+    /* ── Progress ─────────────────────────────────────────────────────── */
+    #progress-card .card-header { justify-content: space-between; }
+    #progress-info { color: var(--text); font-size: 12px; font-weight: normal; text-transform: none; letter-spacing: 0; }
+    .progress-bar-outer {
+      height: 8px;
+      background: var(--surface2);
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 10px 14px;
+    }
+    .progress-bar-inner {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 4px;
+      transition: width .4s ease;
+      width: 0%;
+    }
+    .progress-bar-inner.pruning { background: var(--warn); }
+
+    /* ── Log ──────────────────────────────────────────────────────────── */
+    #log {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      color: var(--text-dim);
+      background: #0d1117;
+      padding: 10px 14px;
+      height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #log .log-error { color: #f85149; }
+    #log .log-ok    { color: #3fb950; }
+
+    /* ── Status badge ─────────────────────────────────────────────────── */
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
+    }
+    .badge-pending   { background: #21262d; color: var(--text-dim); }
+    .badge-running   { background: #1f4068; color: #79c0ff; }
+    .badge-done      { background: #1a3a2a; color: #3fb950; }
+    .badge-error     { background: #3d1818; color: #f85149; }
+    .badge-cancelled { background: #21262d; color: var(--text-dim); }
+
+    /* ── Download row ─────────────────────────────────────────────────── */
+    #download-row {
+      display: none;
+      padding: 12px 14px;
+      gap: 10px;
+      border-top: 1px solid var(--border);
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    #file-list { font-size: 12px; color: var(--text-dim); flex: 1; }
+
+    /* ── Idle state info ──────────────────────────────────────────────── */
+    #idle-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    #idle-card .icon { font-size: 32px; }
+    #idle-card p { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+    #idle-card a { color: var(--blue); }
+
+    /* ── Responsive ───────────────────────────────────────────────────── */
+    @media (max-width: 720px) {
+      #app {
+        grid-template-columns: 1fr;
+        grid-template-rows: 56px auto 1fr;
+      }
+      #sidebar { max-height: 50vh; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- ── Header ───────────────────────────────────────────────────────── -->
+  <header>
+    <h1>⚙ AutoForge</h1>
+    <span>Image → 3D print-ready layered model</span>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+      <span id="status-badge" class="badge badge-pending">Idle</span>
+    </div>
+  </header>
+
+  <!-- ── Sidebar (settings) ───────────────────────────────────────────── -->
+  <aside id="sidebar">
+
+    <!-- Files -->
+    <div class="section open" id="sec-files">
+      <div class="section-header" onclick="toggleSection('sec-files')">
+        📁 Files <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Input Image <span style="color:#f85149">*</span></label>
+          <div class="dropzone" id="dz-image">
+            <input type="file" id="input-image" accept="image/*" />
+            <div class="dz-icon">🖼</div>
+            <div class="dz-label">Click or drag an image here</div>
+            <div class="dz-name" id="dz-image-name"></div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Filament Library (CSV or JSON) <span style="color:#f85149">*</span></label>
+          <div class="dropzone" id="dz-filament">
+            <input type="file" id="input-filament" accept=".csv,.json" />
+            <div class="dz-icon">🎨</div>
+            <div class="dz-label">Click or drag your Hueforge CSV / JSON export</div>
+            <div class="dz-name" id="dz-filament-name"></div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Priority Mask (optional)</label>
+          <div class="dropzone" id="dz-mask">
+            <input type="file" id="input-mask" accept="image/*" />
+            <div class="dz-icon">🎭</div>
+            <div class="dz-label">Grayscale mask — brighter = more detail</div>
+            <div class="dz-name" id="dz-mask-name"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Basic -->
+    <div class="section open" id="sec-basic">
+      <div class="section-header" onclick="toggleSection('sec-basic')">
+        🔧 Basic Settings <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Iterations</label>
+          <input type="number" id="p-iterations" value="6000" min="100" step="100" />
+          <span class="hint">Optimization steps. More = better quality but slower.</span>
+        </div>
+        <div class="field">
+          <label>Max Layers</label>
+          <input type="number" id="p-max_layers" value="75" min="1" max="500" />
+          <span class="hint">Maximum print layers (≈ 75 × 0.04 mm = 3 mm print height).</span>
+        </div>
+        <div class="field">
+          <label>Layer Height (mm)</label>
+          <input type="number" id="p-layer_height" value="0.04" min="0.01" step="0.01" />
+        </div>
+        <div class="field">
+          <label>Background Color</label>
+          <div class="row">
+            <input type="color" id="p-background_color-picker" value="#000000" />
+            <input type="text"  id="p-background_color" value="#000000" style="flex:1" maxlength="7" placeholder="#000000" />
+          </div>
+          <span class="hint">The filament color used for the base layer.</span>
+        </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-auto_background_color" checked />
+          Auto-select background color from image
+        </label>
+        <div class="field">
+          <label>Background Height (mm)</label>
+          <input type="number" id="p-background_height" value="0.24" min="0.04" step="0.04" />
+          <span class="hint">Must be a multiple of layer height.</span>
+        </div>
+        <div class="field">
+          <label>STL Output Size (mm)</label>
+          <input type="number" id="p-stl_output_size" value="150" min="10" max="1000" />
+          <span class="hint">Longest dimension of the generated STL.</span>
+        </div>
+        <div class="field">
+          <label>Nozzle Diameter (mm)</label>
+          <input type="number" id="p-nozzle_diameter" value="0.4" min="0.1" step="0.05" />
+          <span class="hint">Details smaller than ½ nozzle diameter are ignored.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pruning -->
+    <div class="section" id="sec-pruning">
+      <div class="section-header" onclick="toggleSection('sec-pruning')">
+        ✂️ Pruning (Color &amp; Swap Limits) <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-perform_pruning" checked />
+          Perform pruning (strongly recommended)
+        </label>
+        <div class="field">
+          <label>Max Colors</label>
+          <input type="number" id="p-pruning_max_colors" value="100" min="1" />
+          <span class="hint">Includes background. E.g. 8 = 7 colors + 1 background.</span>
+        </div>
+        <div class="field">
+          <label>Max Swaps</label>
+          <input type="number" id="p-pruning_max_swaps" value="100" min="0" />
+        </div>
+        <div class="field">
+          <label>Max Layers (after pruning)</label>
+          <input type="number" id="p-pruning_max_layer" value="75" min="1" />
+        </div>
+        <div class="field">
+          <label>Min Layers (after pruning)</label>
+          <input type="number" id="p-min_layers" value="0" min="0" />
+        </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-fast_pruning" checked />
+          Fast pruning (10–15× faster, slightly less accurate)
+        </label>
+        <div class="field">
+          <label>Fast Pruning Chunk Size</label>
+          <input type="number" id="p-fast_pruning_percent" value="0.25" min="0.01" max="1" step="0.05" />
+          <span class="hint">Fraction of candidates evaluated per chunk.</span>
+        </div>
+        <div class="field">
+          <label>Pruning Batch Size</label>
+          <input type="number" id="p-pruning_batch_size" value="8" min="0" max="64" />
+          <span class="hint">Candidates evaluated in parallel (0 = disabled).</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Output / FlatForge -->
+    <div class="section" id="sec-output">
+      <div class="section-header" onclick="toggleSection('sec-output')">
+        🖨 Output &amp; FlatForge <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-flatforge" />
+          FlatForge mode (separate STL per color, face-down printing)
+        </label>
+        <div class="field">
+          <label>Cap Layers (FlatForge only)</label>
+          <input type="number" id="p-cap_layers" value="0" min="0" />
+          <span class="hint">Transparent cap layers on top for a glossy finish.</span>
+        </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-spike_removal" checked />
+          Spike removal (smooth isolated tall pixels)
+        </label>
+        <div class="field">
+          <label>Spike Threshold (layers)</label>
+          <input type="number" id="p-spike_threshold_layers" value="1" min="0" />
+        </div>
+        <div class="field">
+          <label>Spike Removal Passes</label>
+          <input type="number" id="p-spike_removal_passes" value="4" min="1" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Optimizer -->
+    <div class="section" id="sec-optimizer">
+      <div class="section-header" onclick="toggleSection('sec-optimizer')">
+        📈 Optimizer <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Learning Rate</label>
+          <input type="number" id="p-learning_rate" value="0.015" min="0.0001" step="0.001" />
+        </div>
+        <div class="field">
+          <label>Initial Tau (Gumbel temperature)</label>
+          <input type="number" id="p-init_tau" value="1.0" min="0.01" step="0.1" />
+        </div>
+        <div class="field">
+          <label>Final Tau</label>
+          <input type="number" id="p-final_tau" value="0.01" min="0.001" step="0.001" />
+        </div>
+        <div class="field">
+          <label>Warmup Fraction</label>
+          <input type="number" id="p-warmup_fraction" value="1.0" min="0" max="1" step="0.05" />
+          <span class="hint">Fraction of iterations keeping tau at initial value.</span>
+        </div>
+        <div class="field">
+          <label>LR Warmup Fraction</label>
+          <input type="number" id="p-learning_rate_warmup_fraction" value="0.01" min="0" max="1" step="0.01" />
+        </div>
+        <div class="field">
+          <label>Early Stopping Patience</label>
+          <input type="number" id="p-early_stopping" value="2000" min="0" step="100" />
+          <span class="hint">Steps without improvement before stopping early.</span>
+        </div>
+        <div class="field">
+          <label>Processing Reduction Factor</label>
+          <input type="number" id="p-processing_reduction_factor" value="2" min="1" max="8" />
+          <span class="hint">Downscale factor during optimization (1 = full res, slower).</span>
+        </div>
+        <div class="field">
+          <label>Discrete Check Interval</label>
+          <input type="number" id="p-discrete_check" value="100" min="1" />
+          <span class="hint">Steps between discrete quality snapshots.</span>
+        </div>
+        <div class="field">
+          <label>Best Of (runs)</label>
+          <input type="number" id="p-best_of" value="1" min="1" max="20" />
+          <span class="hint">Run N times and keep the best result.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Initialization -->
+    <div class="section" id="sec-init">
+      <div class="section-header" onclick="toggleSection('sec-init')">
+        🗺 Initialization <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Height Map Method</label>
+          <select id="p-init_heightmap_method">
+            <option value="kmeans" selected>K-means (fast, default)</option>
+            <option value="depth">Depth estimation (requires transformers)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Init Rounds</label>
+          <input type="number" id="p-num_init_rounds" value="64" min="1" />
+          <span class="hint">Candidate height maps evaluated; more = better start.</span>
+        </div>
+        <div class="field">
+          <label>Init Threads</label>
+          <input type="number" id="p-num_init_threads" value="4" min="1" max="32" />
+        </div>
+        <div class="field">
+          <label>Init Cluster Layers</label>
+          <input type="number" id="p-num_init_cluster_layers" value="-1" min="-1" />
+          <span class="hint">-1 = use max_layers automatically.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Misc -->
+    <div class="section" id="sec-misc">
+      <div class="section-header" onclick="toggleSection('sec-misc')">
+        ⚙ Misc <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Random Seed</label>
+          <input type="number" id="p-random_seed" value="0" min="0" />
+          <span class="hint">0 = random seed (non-reproducible).</span>
+        </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-tensorboard" />
+          Enable TensorBoard logging
+        </label>
+        <div class="field">
+          <label>Run Name (TensorBoard)</label>
+          <input type="text" id="p-run_name" value="" placeholder="optional" />
+        </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="p-mps" />
+          Use Apple MPS (Metal) GPU backend
+        </label>
+      </div>
+    </div>
+
+    <!-- Footer buttons -->
+    <div id="sidebar-footer">
+      <button class="btn btn-primary" id="btn-run" onclick="startJob()">▶ Run AutoForge</button>
+      <button class="btn btn-danger" id="btn-cancel" onclick="cancelJob()" disabled>✕ Cancel</button>
+    </div>
+  </aside>
+
+  <!-- ── Main panel ────────────────────────────────────────────────────── -->
+  <main id="main">
+
+    <!-- Idle state -->
+    <div id="idle-card">
+      <div class="icon">🔬</div>
+      <p>
+        Upload an image and a Hueforge filament library, configure the settings on the left, then click
+        <strong>Run AutoForge</strong>. The optimization will run server-side and you'll see a live preview
+        updating here as it progresses.<br><br>
+        Outputs (PNG, STL, swap instructions, .hfp project file) can be downloaded as a ZIP when done.
+        See the <a href="https://github.com/hvoss-techfak/AutoForge" target="_blank">README</a> for details.
+      </p>
+    </div>
+
+    <!-- Preview -->
+    <div class="card" id="preview-card" style="display:none">
+      <div class="card-header">
+        Live Preview
+        <span id="preview-label" style="font-weight:normal;text-transform:none;letter-spacing:0;font-size:12px;color:var(--text-dim)"></span>
+      </div>
+      <div id="preview-wrap">
+        <div id="preview-placeholder">Waiting for first preview…</div>
+        <img id="preview-img" alt="AutoForge preview" />
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="card" id="progress-card" style="display:none">
+      <div class="card-header">
+        Progress
+        <span id="progress-info"></span>
+      </div>
+      <div class="progress-bar-outer">
+        <div class="progress-bar-inner" id="progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="card" id="log-card" style="display:none">
+      <div class="card-header">
+        Log
+        <button class="btn btn-secondary" style="padding:2px 8px;font-size:11px;" onclick="clearLog()">Clear</button>
+      </div>
+      <div id="log"></div>
+      <!-- Download row (shown when done) -->
+      <div id="download-row">
+        <span id="file-list"></span>
+        <a id="btn-download" class="btn btn-primary" style="text-decoration:none;" href="#">⬇ Download Results</a>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let currentJobId = null;
+let ws = null;
+
+// ── Section toggle ─────────────────────────────────────────────────────────
+function toggleSection(id) {
+  const el = document.getElementById(id);
+  el.classList.toggle('open');
+}
+
+// ── File drop zones ────────────────────────────────────────────────────────
+function setupDropzone(dzId, inputId, nameId) {
+  const dz = document.getElementById(dzId);
+  const input = document.getElementById(inputId);
+  const nameEl = document.getElementById(nameId);
+
+  input.addEventListener('change', () => {
+    if (input.files[0]) nameEl.textContent = input.files[0].name;
+  });
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault();
+    dz.classList.remove('drag-over');
+    const files = e.dataTransfer.files;
+    if (files.length) {
+      const dt = new DataTransfer();
+      dt.items.add(files[0]);
+      input.files = dt.files;
+      nameEl.textContent = files[0].name;
+    }
+  });
+}
+setupDropzone('dz-image', 'input-image', 'dz-image-name');
+setupDropzone('dz-filament', 'input-filament', 'dz-filament-name');
+setupDropzone('dz-mask', 'input-mask', 'dz-mask-name');
+
+// ── Color picker sync ──────────────────────────────────────────────────────
+const colorPicker = document.getElementById('p-background_color-picker');
+const colorText   = document.getElementById('p-background_color');
+colorPicker.addEventListener('input', () => { colorText.value = colorPicker.value; });
+colorText.addEventListener('input', () => {
+  if (/^#[0-9a-fA-F]{6}$/.test(colorText.value)) colorPicker.value = colorText.value;
+});
+
+// ── Collect all parameters ─────────────────────────────────────────────────
+function getParams() {
+  const bool = id => document.getElementById(id).checked;
+  const num  = id => parseFloat(document.getElementById(id).value);
+  const int_ = id => parseInt(document.getElementById(id).value, 10);
+  const str_ = id => document.getElementById(id).value.trim();
+
+  return {
+    iterations:                    int_('p-iterations'),
+    max_layers:                    int_('p-max_layers'),
+    layer_height:                  num('p-layer_height'),
+    background_color:              str_('p-background_color'),
+    auto_background_color:         bool('p-auto_background_color'),
+    background_height:             num('p-background_height'),
+    stl_output_size:               int_('p-stl_output_size'),
+    nozzle_diameter:               num('p-nozzle_diameter'),
+    // pruning
+    perform_pruning:               bool('p-perform_pruning'),
+    pruning_max_colors:            int_('p-pruning_max_colors'),
+    pruning_max_swaps:             int_('p-pruning_max_swaps'),
+    pruning_max_layer:             int_('p-pruning_max_layer'),
+    min_layers:                    int_('p-min_layers'),
+    fast_pruning:                  bool('p-fast_pruning'),
+    fast_pruning_percent:          num('p-fast_pruning_percent'),
+    pruning_batch_size:            int_('p-pruning_batch_size'),
+    // output
+    flatforge:                     bool('p-flatforge'),
+    cap_layers:                    int_('p-cap_layers'),
+    spike_removal:                 bool('p-spike_removal'),
+    spike_threshold_layers:        int_('p-spike_threshold_layers'),
+    spike_removal_passes:          int_('p-spike_removal_passes'),
+    // optimizer
+    learning_rate:                 num('p-learning_rate'),
+    init_tau:                      num('p-init_tau'),
+    final_tau:                     num('p-final_tau'),
+    warmup_fraction:               num('p-warmup_fraction'),
+    learning_rate_warmup_fraction: num('p-learning_rate_warmup_fraction'),
+    early_stopping:                int_('p-early_stopping'),
+    processing_reduction_factor:   int_('p-processing_reduction_factor'),
+    discrete_check:                int_('p-discrete_check'),
+    best_of:                       int_('p-best_of'),
+    // init
+    init_heightmap_method:         str_('p-init_heightmap_method'),
+    num_init_rounds:               int_('p-num_init_rounds'),
+    num_init_threads:              int_('p-num_init_threads'),
+    num_init_cluster_layers:       int_('p-num_init_cluster_layers'),
+    // misc
+    random_seed:                   int_('p-random_seed'),
+    tensorboard:                   bool('p-tensorboard'),
+    run_name:                      str_('p-run_name'),
+    mps:                           bool('p-mps'),
+  };
+}
+
+// ── Start a job ────────────────────────────────────────────────────────────
+async function startJob() {
+  const imageFile    = document.getElementById('input-image').files[0];
+  const filamentFile = document.getElementById('input-filament').files[0];
+  const maskFile     = document.getElementById('input-mask').files[0];
+
+  if (!imageFile)    { alert('Please upload an input image.'); return; }
+  if (!filamentFile) { alert('Please upload a filament library (CSV or JSON).'); return; }
+
+  setRunning(true);
+  clearLog();
+  resetPreview();
+  hideDownload();
+  showCards(true);
+
+  const fd = new FormData();
+  fd.append('image', imageFile);
+  fd.append('filament_file', filamentFile);
+  fd.append('params', JSON.stringify(getParams()));
+  if (maskFile) fd.append('priority_mask', maskFile);
+
+  let resp;
+  try {
+    resp = await fetch('/api/jobs', { method: 'POST', body: fd });
+  } catch (e) {
+    appendLog('Network error: ' + e, 'error');
+    setRunning(false);
+    return;
+  }
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    appendLog('Server error: ' + txt, 'error');
+    setRunning(false);
+    return;
+  }
+
+  const { job_id } = await resp.json();
+  currentJobId = job_id;
+  setBadge('running', 'Running');
+  connectWS(job_id);
+}
+
+// ── Cancel ─────────────────────────────────────────────────────────────────
+async function cancelJob() {
+  if (!currentJobId) return;
+  if (ws) ws.send(JSON.stringify({ type: 'cancel' }));
+  await fetch(`/api/jobs/${currentJobId}/cancel`, { method: 'POST' });
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connectWS(jobId) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/${jobId}`);
+
+  ws.onmessage = e => handleMessage(JSON.parse(e.data));
+
+  ws.onerror = () => appendLog('WebSocket error.', 'error');
+
+  ws.onclose = () => {
+    ws = null;
+    // If still running, poll until done
+    if (currentJobId === jobId) pollFallback(jobId);
+  };
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'log':
+      appendLog(msg.message);
+      break;
+    case 'progress':
+      updateProgress(msg);
+      break;
+    case 'preview':
+      updatePreview(msg.image);
+      break;
+    case 'status':
+      onStatus(msg.status);
+      break;
+    case 'done':
+      onDone(msg.files);
+      break;
+    case 'error':
+      appendLog('ERROR: ' + msg.message, 'error');
+      break;
+  }
+}
+
+// ── Fallback poll (if WS disconnects mid-job) ──────────────────────────────
+async function pollFallback(jobId) {
+  if (currentJobId !== jobId) return;
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`);
+    if (r.ok) {
+      const d = await r.json();
+      if (d.status === 'done') onDone(d.files);
+      else if (d.status === 'error') { appendLog('ERROR: ' + d.error, 'error'); setRunning(false); setBadge('error', 'Error'); }
+      else if (d.status === 'cancelled') { setRunning(false); setBadge('cancelled', 'Cancelled'); }
+      else setTimeout(() => pollFallback(jobId), 3000);
+    }
+  } catch (_) { setTimeout(() => pollFallback(jobId), 5000); }
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+function updateProgress(msg) {
+  const bar  = document.getElementById('progress-bar');
+  const info = document.getElementById('progress-info');
+  const pct  = Math.max(0, Math.min(100, msg.percent ?? 0));
+
+  bar.style.width = pct + '%';
+  bar.classList.toggle('pruning', msg.phase === 'pruning');
+
+  if (msg.phase === 'optimizing') {
+    info.textContent = `Step ${msg.step} / ${msg.total}  |  loss ${(msg.loss||0).toFixed(4)}  |  best ${(msg.best_loss||0).toFixed(4)}`;
+  } else {
+    info.textContent = `Pruning… ${pct}%`;
+  }
+}
+
+function updatePreview(b64) {
+  const img = document.getElementById('preview-img');
+  const ph  = document.getElementById('preview-placeholder');
+  img.src = 'data:image/jpeg;base64,' + b64;
+  img.style.display = 'block';
+  ph.style.display  = 'none';
+
+  // Update label with timestamp
+  document.getElementById('preview-label').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+function resetPreview() {
+  const img = document.getElementById('preview-img');
+  const ph  = document.getElementById('preview-placeholder');
+  img.src = '';
+  img.style.display = 'none';
+  ph.style.display  = 'block';
+  ph.textContent    = 'Waiting for first preview…';
+}
+
+function appendLog(text, type) {
+  const log = document.getElementById('log');
+  const line = document.createElement('div');
+  if (type === 'error') line.className = 'log-error';
+  if (type === 'ok')    line.className = 'log-ok';
+  line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+}
+
+function setBadge(status, label) {
+  const b = document.getElementById('status-badge');
+  b.className = 'badge badge-' + status;
+  b.textContent = label;
+}
+
+function setRunning(running) {
+  document.getElementById('btn-run').disabled    = running;
+  document.getElementById('btn-cancel').disabled = !running;
+  document.getElementById('progress-bar').style.width = running ? '0%' : document.getElementById('progress-bar').style.width;
+}
+
+function showCards(show) {
+  ['preview-card', 'progress-card', 'log-card'].forEach(id => {
+    document.getElementById(id).style.display = show ? 'block' : 'none';
+  });
+  document.getElementById('idle-card').style.display = show ? 'none' : 'flex';
+}
+
+function hideDownload() {
+  document.getElementById('download-row').style.display = 'none';
+}
+
+function onStatus(status) {
+  const labels = { running: 'Running', done: 'Done', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
+  setBadge(status, labels[status] || status);
+  if (['done', 'error', 'cancelled'].includes(status)) setRunning(false);
+}
+
+function onDone(files) {
+  setBadge('done', 'Done ✓');
+  setRunning(false);
+  appendLog('✓ All done! Files: ' + (files || []).join(', '), 'ok');
+
+  if (currentJobId && files && files.length) {
+    const dl = document.getElementById('btn-download');
+    dl.href = `/api/jobs/${currentJobId}/download`;
+    document.getElementById('file-list').textContent = 'Files: ' + files.join(', ');
+    document.getElementById('download-row').style.display = 'flex';
+  }
+
+  document.getElementById('progress-bar').style.width = '100%';
+  document.getElementById('progress-bar').classList.remove('pruning');
+  document.getElementById('progress-info').textContent = 'Complete';
+}
+</script>
+</body>
+</html>
