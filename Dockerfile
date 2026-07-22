@@ -34,6 +34,16 @@ RUN pip install --upgrade pip --no-cache-dir && \
 # Expose the web UI port
 EXPOSE 7860
 
+# Job history (uploads, results, meta.json) is written to /root/.autoforge
+# by default, or /data if it exists (the conventional persistent-storage
+# mount point on Hugging Face Spaces and similar platforms). Declaring both
+# as volumes here documents that they should be bind-mounted / backed by a
+# named volume — without that, history is lost whenever the container is
+# redeployed/recreated (only `docker restart` on the same container keeps
+# its writable layer). Override the location entirely with
+# AUTOFORGE_JOBS_DIR if neither default suits your setup.
+VOLUME ["/root/.autoforge", "/data"]
+
 # Default: start the web UI.
 # To run the CLI instead: docker run --entrypoint autoforge <image> [args]
 ENTRYPOINT ["autoforge-webui"]

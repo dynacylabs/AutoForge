@@ -9,6 +9,19 @@ AutoForge is a Python tool for generating 3D printed layered models from an inpu
 This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
 For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
 
+### Persisting job history when running the Docker container yourself
+The web UI keeps a history of past jobs (inputs, results, settings) on disk under `/root/.autoforge/webui_jobs`
+(or `/data/autoforge_webui_jobs` if `/data` exists, e.g. on Hugging Face Spaces with persistent storage enabled).
+That directory lives in the container's writable layer, so **history is lost whenever the container is removed
+and recreated** (a plain `docker restart` is fine, `docker rm` + `docker run` is not) unless you mount a volume:
+```bash
+docker run -p 7860:7860 -v autoforge_jobs:/root/.autoforge autoforge-webui
+```
+or point it anywhere you like with the `AUTOFORGE_JOBS_DIR` environment variable:
+```bash
+docker run -p 7860:7860 -e AUTOFORGE_JOBS_DIR=/data/jobs -v /path/on/host:/data/jobs autoforge-webui
+```
+
 ## Example
 All examples use only the 27 BambuLab Basic PLA filaments, currently available in Hueforge 0.9.0, the background color is set to black.
 The pruning is set to a maximum of 8 color and 20 swaps, so each image uses at most 8 different colors and swaps the filament at most 20 times. 

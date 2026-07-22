@@ -964,9 +964,13 @@ function renderHistory(groups) {
           ${v.status === 'done'
             ? `<a class="btn btn-secondary history-btn" style="text-decoration:none;" title="Download this version" href="/api/jobs/${v.job_id}/download" onclick="event.stopPropagation()">⬇</a>`
             : ''}
+          ${(v.status === 'running' || v.status === 'pending')
+            ? ''
+            : `<button class="btn btn-danger history-btn" title="Delete this version" onclick="event.stopPropagation(); deleteVersion('${g.group_id}','${v.job_id}')">🗑</button>`}
         </div>
       </div>
     `).join('');
+    const groupHasActive = g.versions.some(v => v.status === 'running' || v.status === 'pending');
     return `
       <div class="history-group">
         <div class="history-group-header">
@@ -975,6 +979,7 @@ function renderHistory(groups) {
             <div class="history-group-name" title="${escapeHtml(g.image_filename)}">${escapeHtml(g.image_filename)}</div>
             <div class="history-group-date">${new Date(g.created_at * 1000).toLocaleString()}</div>
           </div>
+          <button class="btn btn-danger history-btn" title="Delete entire history entry (all versions)" ${groupHasActive ? 'disabled' : ''} onclick="event.stopPropagation(); deleteGroup('${g.group_id}')">🗑</button>
         </div>
         <div class="history-versions">${versionsHtml}</div>
       </div>
@@ -1060,6 +1065,51 @@ async function viewHistoryVersion(groupId, jobId) {
     document.getElementById('preview-placeholder').textContent =
       version.status === 'error' ? 'This job did not complete successfully.' : 'No preview available for this job.';
   }
+}
+
+// ── Delete history entries ──────────────────────────────────────────────────
+function resetToIdleIfShowing(jobId, groupId) {
+  if (currentJobId === jobId || (groupId && activeGroupId === groupId)) {
+    currentJobId = null;
+    if (ws) { ws.close(); ws = null; }
+    if (activeGroupId === groupId) cancelEditing();
+    showCards(false);
+    setBadge('pending', 'Idle');
+  }
+}
+
+async function deleteVersion(groupId, jobId) {
+  if (!confirm('Delete this job version? This cannot be undone.')) return;
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      alert(d.error || 'Failed to delete job.');
+      return;
+    }
+  } catch (e) {
+    alert('Network error: ' + e);
+    return;
+  }
+  resetToIdleIfShowing(jobId, groupId);
+  loadHistory();
+}
+
+async function deleteGroup(groupId) {
+  if (!confirm('Delete this entire history entry, including all versions? This cannot be undone.')) return;
+  try {
+    const r = await fetch(`/api/history/${groupId}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      alert(d.error || 'Failed to delete history entry.');
+      return;
+    }
+  } catch (e) {
+    alert('Network error: ' + e);
+    return;
+  }
+  resetToIdleIfShowing(currentJobId, groupId);
+  loadHistory();
 }
 
 function applyParams(params) {

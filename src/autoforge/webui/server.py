@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -34,11 +35,31 @@ from fastapi.staticfiles import StaticFiles
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
+
+def _default_jobs_dir() -> str:
+    """Pick a sensible default location for persistent job history.
+
+    Job history is only actually persistent if JOBS_DIR points at storage
+    that survives a container redeploy/recreate (a mounted volume) rather
+    than the container's own writable layer. `/data` is the conventional
+    mount point for persistent storage on Hugging Face Spaces and many other
+    container platforms, so prefer it when present and writable. Otherwise
+    fall back to a directory under the user's home (fine for bare-metal /
+    dev installs, but will NOT survive redeploying a container unless that
+    path is explicitly bind-mounted — see AUTOFORGE_JOBS_DIR below).
+    """
+    data_dir = "/data"
+    if os.path.isdir(data_dir) and os.access(data_dir, os.W_OK):
+        return os.path.join(data_dir, "autoforge_webui_jobs")
+    return os.path.join(os.path.expanduser("~"), ".autoforge", "webui_jobs")
+
+
 # Persistent on-disk location for job history (survives server restarts).
-JOBS_DIR = os.environ.get(
-    "AUTOFORGE_JOBS_DIR",
-    os.path.join(os.path.expanduser("~"), ".autoforge", "webui_jobs"),
-)
+# Set AUTOFORGE_JOBS_DIR to an explicit path (ideally a mounted volume) to
+# make sure history survives redeploying/recreating the container — without
+# a volume mount, anything written here lives only in the container's
+# writable layer and is lost when the container is removed and recreated.
+JOBS_DIR = os.environ.get("AUTOFORGE_JOBS_DIR", _default_jobs_dir())
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 app = FastAPI(title="AutoForge Web UI")
@@ -464,7 +485,12 @@ def _build_args(
 
 def _start_new_version(group: JobGroup, p: dict) -> str:
     """Create and submit a new job version within an existing group."""
-    version = len(group.versions) + 1
+    # Use max(existing version numbers) + 1 rather than len(versions) + 1 so
+    # that numbering stays correct even after an older version has been
+    # deleted (which would otherwise leave a gap and risk re-using — and
+    # overwriting the on-disk output directory of — an existing version).
+    existing_versions = [_jobs[jid].version for jid in group.versions if jid in _jobs]
+    version = (max(existing_versions) if existing_versions else 0) + 1
     job_id = str(uuid.uuid4())
     output_dir = os.path.join(group.group_dir, f"v{version}")
     os.makedirs(output_dir, exist_ok=True)
@@ -612,6 +638,66 @@ async def rerun_job(group_id: str, payload: dict = Body(default={})) -> JSONResp
         p = {}
     job_id = _start_new_version(group, p)
     return JSONResponse({"job_id": job_id, "group_id": group_id})
+
+
+def _is_active(job: "Job") -> bool:
+    return job.status in (JobStatus.RUNNING, JobStatus.PENDING)
+
+
+@app.delete("/api/history/{group_id}", response_class=JSONResponse)
+async def delete_group(group_id: str) -> JSONResponse:
+    """Delete an entire job history entry (all versions of one upload)."""
+    group = _groups.get(group_id)
+    if group is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    jobs = [_jobs[jid] for jid in group.versions if jid in _jobs]
+    if any(_is_active(job) for job in jobs):
+        return JSONResponse(
+            {"error": "Cannot delete: a job in this group is still running."},
+            status_code=409,
+        )
+
+    with _meta_lock:
+        shutil.rmtree(group.group_dir, ignore_errors=True)
+        for job in jobs:
+            _jobs.pop(job.job_id, None)
+        _groups.pop(group_id, None)
+
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/jobs/{job_id}", response_class=JSONResponse)
+async def delete_job(job_id: str) -> JSONResponse:
+    """Delete a single job version. Removes the whole group if it was the
+    last remaining version."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if _is_active(job):
+        return JSONResponse(
+            {"error": "Cannot delete a job that is still running."},
+            status_code=409,
+        )
+
+    group = _groups.get(job.group_id)
+    if group is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    with _meta_lock:
+        shutil.rmtree(job.output_dir, ignore_errors=True)
+        _jobs.pop(job_id, None)
+        if job_id in group.versions:
+            group.versions.remove(job_id)
+
+        if not group.versions:
+            shutil.rmtree(group.group_dir, ignore_errors=True)
+            _groups.pop(group.group_id, None)
+
+    if group.versions:
+        _save_meta(group)
+
+    return JSONResponse({"ok": True})
 
 
 @app.get("/api/jobs/{job_id}", response_class=JSONResponse)
