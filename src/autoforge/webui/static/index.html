@@ -45,6 +45,11 @@
     header span { color: var(--text-dim); font-size: 13px; }
     #sidebar {
       overflow-y: auto;
+      /* Grid items default to min-height:auto, which stops them from
+         shrinking below their content size — without this the sidebar
+         would grow past its track and get clipped by #app's overflow:hidden
+         instead of scrolling internally. */
+      min-height: 0;
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
@@ -60,10 +65,14 @@
     #sidebar::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
     #main {
       overflow-y: auto;
+      /* Same fix as #sidebar above — without min-height:0 the download
+         button at the bottom of the log card could be cut off by the
+         viewport instead of being reachable via scroll. */
+      min-height: 0;
       display: flex;
       flex-direction: column;
       gap: 16px;
-      padding: 20px;
+      padding: 20px 20px 28px;
     }
 
     /* ── Sidebar form ─────────────────────────────────────────────────── */
@@ -282,6 +291,70 @@
     #idle-card p { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
     #idle-card a { color: var(--blue); }
 
+    /* ── History panel ────────────────────────────────────────────────── */
+    #history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .history-empty { font-size: 12px; color: var(--text-dim); }
+    .history-group {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--surface2);
+    }
+    .history-group-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+    }
+    .history-thumb {
+      width: 40px; height: 40px;
+      object-fit: cover;
+      border-radius: 4px;
+      background: #000;
+      flex-shrink: 0;
+    }
+    .history-group-info { min-width: 0; flex: 1; }
+    .history-group-name {
+      font-size: 12px; font-weight: 600; color: var(--text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .history-group-date { font-size: 11px; color: var(--text-dim); }
+    .history-versions {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 0 8px 8px;
+    }
+    .history-version {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+    }
+    .history-version-num { color: var(--text-dim); }
+    .history-version-actions { display: flex; gap: 4px; margin-left: auto; }
+    .history-btn { padding: 3px 8px !important; font-size: 11px !important; }
+
+    #editing-banner {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      background: #1f4068;
+      color: #79c0ff;
+      font-size: 12px;
+      border-top: 1px solid var(--border);
+    }
+    #editing-banner strong { color: #fff; }
+    #editing-banner button { margin-left: auto; }
+
+
     /* ── Responsive ───────────────────────────────────────────────────── */
     @media (max-width: 720px) {
       #app {
@@ -305,6 +378,16 @@
 
   <!-- ── Sidebar (settings) ───────────────────────────────────────────── -->
   <aside id="sidebar">
+
+    <!-- History -->
+    <div class="section open" id="sec-history">
+      <div class="section-header" onclick="toggleSection('sec-history')">
+        🕑 Job History <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div id="history-list"><p class="history-empty">Loading…</p></div>
+      </div>
+    </div>
 
     <!-- Files -->
     <div class="section open" id="sec-files">
@@ -572,6 +655,12 @@
       </div>
     </div>
 
+    <!-- Editing banner (shown when tweaking settings of a past job) -->
+    <div id="editing-banner">
+      <span>Editing settings from <strong id="editing-label"></strong> — Run creates a new version.</span>
+      <button class="btn btn-secondary" style="padding:2px 8px;font-size:11px;" onclick="cancelEditing()">Cancel</button>
+    </div>
+
     <!-- Footer buttons -->
     <div id="sidebar-footer">
       <button class="btn btn-primary" id="btn-run" onclick="startJob()">▶ Run AutoForge</button>
@@ -638,6 +727,9 @@
 // ── State ──────────────────────────────────────────────────────────────────
 let currentJobId = null;
 let ws = null;
+let activeGroupId = null;
+let activeGroupLabel = null;
+let historyCache = null;
 
 // ── Section toggle ─────────────────────────────────────────────────────────
 function toggleSection(id) {
@@ -740,8 +832,20 @@ async function startJob() {
   const filamentFile = document.getElementById('input-filament').files[0];
   const maskFile     = document.getElementById('input-mask').files[0];
 
+  // If we're editing settings for a past job and no new files were picked,
+  // re-run against that job's original inputs as a new version.
+  if (activeGroupId && !imageFile && !filamentFile) {
+    await startRerun();
+    return;
+  }
+
   if (!imageFile)    { alert('Please upload an input image.'); return; }
   if (!filamentFile) { alert('Please upload a filament library (CSV or JSON).'); return; }
+
+  // A fresh upload always starts a brand-new history entry.
+  activeGroupId = null;
+  activeGroupLabel = null;
+  updateEditingBanner();
 
   setRunning(true);
   clearLog();
@@ -775,7 +879,185 @@ async function startJob() {
   currentJobId = job_id;
   setBadge('running', 'Running');
   connectWS(job_id);
+  loadHistory();
 }
+
+// ── Re-run an existing job with tweaked settings ────────────────────────────
+async function startRerun() {
+  setRunning(true);
+  clearLog();
+  resetPreview();
+  hideDownload();
+  showCards(true);
+
+  let resp;
+  try {
+    resp = await fetch(`/api/history/${activeGroupId}/rerun`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: getParams() }),
+    });
+  } catch (e) {
+    appendLog('Network error: ' + e, 'error');
+    setRunning(false);
+    return;
+  }
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    appendLog('Server error: ' + txt, 'error');
+    setRunning(false);
+    return;
+  }
+
+  const { job_id } = await resp.json();
+  currentJobId = job_id;
+  setBadge('running', 'Running');
+  connectWS(job_id);
+  loadHistory();
+}
+
+// ── History panel ────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history');
+    if (!r.ok) return;
+    const data = await r.json();
+    historyCache = data;
+    renderHistory(data.groups || []);
+  } catch (_) { /* ignore, keep showing last known list */ }
+}
+
+function renderHistory(groups) {
+  const el = document.getElementById('history-list');
+  if (!groups.length) {
+    el.innerHTML = '<p class="history-empty">No previous jobs yet.</p>';
+    return;
+  }
+  const labels = { running: 'Running', done: 'Done', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
+  el.innerHTML = groups.map(g => {
+    const versionsHtml = g.versions.slice().reverse().map(v => `
+      <div class="history-version">
+        <span class="badge badge-${v.status}">${labels[v.status] || v.status}</span>
+        <span class="history-version-num">v${v.version}</span>
+        <div class="history-version-actions">
+          <button class="btn btn-secondary history-btn" title="Load these settings for editing" onclick="loadSettingsFromVersion('${g.group_id}','${v.job_id}')">✎ Edit</button>
+          ${v.status === 'done'
+            ? `<a class="btn btn-secondary history-btn" style="text-decoration:none;" title="Download this version" href="/api/jobs/${v.job_id}/download">⬇</a>`
+            : ''}
+        </div>
+      </div>
+    `).join('');
+    return `
+      <div class="history-group">
+        <div class="history-group-header">
+          <img class="history-thumb" src="/api/history/${g.group_id}/thumbnail" alt="" onerror="this.style.visibility='hidden'" />
+          <div class="history-group-info">
+            <div class="history-group-name" title="${escapeHtml(g.image_filename)}">${escapeHtml(g.image_filename)}</div>
+            <div class="history-group-date">${new Date(g.created_at * 1000).toLocaleString()}</div>
+          </div>
+        </div>
+        <div class="history-versions">${versionsHtml}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function loadSettingsFromVersion(groupId, jobId) {
+  let data = historyCache;
+  if (!data) {
+    const r = await fetch('/api/history');
+    if (!r.ok) return;
+    data = await r.json();
+    historyCache = data;
+  }
+  const group = (data.groups || []).find(g => g.group_id === groupId);
+  if (!group) return;
+  const version = group.versions.find(v => v.job_id === jobId);
+  if (!version) return;
+
+  applyParams(version.params || {});
+
+  // Clear any freshly-picked files — the re-run reuses the original inputs.
+  ['input-image', 'input-filament', 'input-mask'].forEach(id => { document.getElementById(id).value = ''; });
+  ['dz-image-name', 'dz-filament-name', 'dz-mask-name'].forEach(id => { document.getElementById(id).textContent = ''; });
+
+  activeGroupId = groupId;
+  activeGroupLabel = group.image_filename;
+  updateEditingBanner();
+}
+
+function applyParams(params) {
+  const setBool = (id, v) => { if (v === undefined) return; const el = document.getElementById(id); if (el) el.checked = !!v; };
+  const setVal  = (id, v) => { if (v === undefined || v === null) return; const el = document.getElementById(id); if (el) el.value = v; };
+
+  setVal('p-iterations', params.iterations);
+  setVal('p-max_layers', params.max_layers);
+  setVal('p-layer_height', params.layer_height);
+  setVal('p-background_color', params.background_color);
+  if (params.background_color) document.getElementById('p-background_color-picker').value = params.background_color;
+  setBool('p-auto_background_color', params.auto_background_color);
+  setVal('p-background_height', params.background_height);
+  setVal('p-stl_output_size', params.stl_output_size);
+  setVal('p-nozzle_diameter', params.nozzle_diameter);
+  setBool('p-perform_pruning', params.perform_pruning);
+  setVal('p-pruning_max_colors', params.pruning_max_colors);
+  setVal('p-pruning_max_swaps', params.pruning_max_swaps);
+  setVal('p-pruning_max_layer', params.pruning_max_layer);
+  setVal('p-min_layers', params.min_layers);
+  setBool('p-fast_pruning', params.fast_pruning);
+  setVal('p-fast_pruning_percent', params.fast_pruning_percent);
+  setVal('p-pruning_batch_size', params.pruning_batch_size);
+  setBool('p-flatforge', params.flatforge);
+  setVal('p-cap_layers', params.cap_layers);
+  setBool('p-spike_removal', params.spike_removal);
+  setVal('p-spike_threshold_layers', params.spike_threshold_layers);
+  setVal('p-spike_removal_passes', params.spike_removal_passes);
+  setVal('p-learning_rate', params.learning_rate);
+  setVal('p-init_tau', params.init_tau);
+  setVal('p-final_tau', params.final_tau);
+  setVal('p-warmup_fraction', params.warmup_fraction);
+  setVal('p-learning_rate_warmup_fraction', params.learning_rate_warmup_fraction);
+  setVal('p-early_stopping', params.early_stopping);
+  setVal('p-processing_reduction_factor', params.processing_reduction_factor);
+  setVal('p-discrete_check', params.discrete_check);
+  setVal('p-best_of', params.best_of);
+  setVal('p-init_heightmap_method', params.init_heightmap_method);
+  setVal('p-num_init_rounds', params.num_init_rounds);
+  setVal('p-num_init_threads', params.num_init_threads);
+  setVal('p-num_init_cluster_layers', params.num_init_cluster_layers);
+  setVal('p-random_seed', params.random_seed);
+  setBool('p-tensorboard', params.tensorboard);
+  setVal('p-run_name', params.run_name);
+  setBool('p-mps', params.mps);
+}
+
+function updateEditingBanner() {
+  const banner = document.getElementById('editing-banner');
+  const runBtn = document.getElementById('btn-run');
+  if (activeGroupId) {
+    banner.style.display = 'flex';
+    document.getElementById('editing-label').textContent = activeGroupLabel || '';
+    runBtn.textContent = '▶ Run New Version';
+  } else {
+    banner.style.display = 'none';
+    runBtn.textContent = '▶ Run AutoForge';
+  }
+}
+
+function cancelEditing() {
+  activeGroupId = null;
+  activeGroupLabel = null;
+  updateEditingBanner();
+}
+
+loadHistory();
 
 // ── Cancel ─────────────────────────────────────────────────────────────────
 async function cancelJob() {
@@ -831,8 +1113,8 @@ async function pollFallback(jobId) {
     if (r.ok) {
       const d = await r.json();
       if (d.status === 'done') onDone(d.files);
-      else if (d.status === 'error') { appendLog('ERROR: ' + d.error, 'error'); setRunning(false); setBadge('error', 'Error'); }
-      else if (d.status === 'cancelled') { setRunning(false); setBadge('cancelled', 'Cancelled'); }
+      else if (d.status === 'error') { appendLog('ERROR: ' + d.error, 'error'); setRunning(false); setBadge('error', 'Error'); loadHistory(); }
+      else if (d.status === 'cancelled') { setRunning(false); setBadge('cancelled', 'Cancelled'); loadHistory(); }
       else setTimeout(() => pollFallback(jobId), 3000);
     }
   } catch (_) { setTimeout(() => pollFallback(jobId), 5000); }
@@ -914,7 +1196,10 @@ function hideDownload() {
 function onStatus(status) {
   const labels = { running: 'Running', done: 'Done', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
   setBadge(status, labels[status] || status);
-  if (['done', 'error', 'cancelled'].includes(status)) setRunning(false);
+  if (['done', 'error', 'cancelled'].includes(status)) {
+    setRunning(false);
+    loadHistory();
+  }
 }
 
 function onDone(files) {
@@ -932,6 +1217,7 @@ function onDone(files) {
   document.getElementById('progress-bar').style.width = '100%';
   document.getElementById('progress-bar').classList.remove('pruning');
   document.getElementById('progress-info').textContent = 'Complete';
+  loadHistory();
 }
 </script>
 </body>

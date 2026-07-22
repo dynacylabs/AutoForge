@@ -9,8 +9,8 @@ import contextlib
 import io
 import json
 import os
-import tempfile
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -20,11 +20,26 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 import torch
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body,
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+# Persistent on-disk location for job history (survives server restarts).
+JOBS_DIR = os.environ.get(
+    "AUTOFORGE_JOBS_DIR",
+    os.path.join(os.path.expanduser("~"), ".autoforge", "webui_jobs"),
+)
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 app = FastAPI(title="AutoForge Web UI")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -32,6 +47,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # Only one GPU job runs at a time.
 _executor = ThreadPoolExecutor(max_workers=1)
 _jobs: Dict[str, "Job"] = {}
+_groups: Dict[str, "JobGroup"] = {}
+_meta_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -46,10 +63,47 @@ class JobStatus:
     CANCELLED = "cancelled"
 
 
+class JobGroup:
+    """A history entry: one set of uploaded inputs shared by 1+ job versions."""
+
+    def __init__(
+        self,
+        group_id: str,
+        group_dir: str,
+        image_filename: str,
+        filament_filename: str,
+        filament_ext: str,
+        has_priority_mask: bool,
+        created_at: Optional[float] = None,
+    ) -> None:
+        self.group_id = group_id
+        self.group_dir = group_dir
+        self.image_filename = image_filename
+        self.filament_filename = filament_filename
+        self.filament_ext = filament_ext
+        self.has_priority_mask = has_priority_mask
+        self.created_at = created_at if created_at is not None else time.time()
+        self.versions: List[str] = []  # ordered list of job_ids (v1, v2, ...)
+
+    @property
+    def inputs_dir(self) -> str:
+        return os.path.join(self.group_dir, "inputs")
+
+    @property
+    def meta_path(self) -> str:
+        return os.path.join(self.group_dir, "meta.json")
+
+
 class Job:
-    def __init__(self, job_id: str, output_dir: str) -> None:
+    def __init__(
+        self, job_id: str, output_dir: str, group_id: str, version: int
+    ) -> None:
         self.job_id = job_id
         self.output_dir = output_dir
+        self.group_id = group_id
+        self.version = version
+        self.params: dict = {}
+        self.created_at: float = time.time()
         self.status: str = JobStatus.PENDING
         self.error_msg: str = ""
         self.step: int = 0
@@ -74,6 +128,104 @@ def _push(job: Job, msg: dict) -> None:
             job.loop.call_soon_threadsafe(job.queue.put_nowait, msg)
         except Exception:
             pass
+
+
+def _find_input(inputs_dir: str, prefix: str) -> Optional[str]:
+    """Find the saved input file whose name starts with ``prefix``."""
+    if not os.path.isdir(inputs_dir):
+        return None
+    for fname in os.listdir(inputs_dir):
+        if fname.startswith(prefix):
+            return os.path.join(inputs_dir, fname)
+    return None
+
+
+def _save_meta(group: JobGroup) -> None:
+    """Persist a job group's metadata (and all of its versions) to disk."""
+    with _meta_lock:
+        versions = []
+        for job_id in group.versions:
+            job = _jobs.get(job_id)
+            if job is None:
+                continue
+            versions.append({
+                "job_id": job.job_id,
+                "version": job.version,
+                "status": job.status,
+                "params": job.params,
+                "output_files": job.output_files,
+                "error_msg": job.error_msg,
+                "created_at": job.created_at,
+            })
+        data = {
+            "group_id": group.group_id,
+            "created_at": group.created_at,
+            "image_filename": group.image_filename,
+            "filament_filename": group.filament_filename,
+            "filament_ext": group.filament_ext,
+            "has_priority_mask": group.has_priority_mask,
+            "versions": versions,
+        }
+        os.makedirs(group.group_dir, exist_ok=True)
+        tmp_path = group.meta_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp_path, group.meta_path)
+
+
+def _save_meta_for_job(job: Job) -> None:
+    group = _groups.get(job.group_id)
+    if group is not None:
+        _save_meta(group)
+
+
+def _load_history() -> None:
+    """Rebuild the in-memory job/group registry from JOBS_DIR on startup."""
+    if not os.path.isdir(JOBS_DIR):
+        return
+    for group_id in sorted(os.listdir(JOBS_DIR)):
+        group_dir = os.path.join(JOBS_DIR, group_id)
+        meta_path = os.path.join(group_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        group = JobGroup(
+            group_id=data.get("group_id", group_id),
+            group_dir=group_dir,
+            image_filename=data.get("image_filename", "input"),
+            filament_filename=data.get("filament_filename", "filaments"),
+            filament_ext=data.get("filament_ext", ".csv"),
+            has_priority_mask=data.get("has_priority_mask", False),
+            created_at=data.get("created_at"),
+        )
+
+        for v in data.get("versions", []):
+            job_id = v.get("job_id") or str(uuid.uuid4())
+            version = v.get("version", 1)
+            output_dir = os.path.join(group_dir, f"v{version}")
+            job = Job(job_id, output_dir, group.group_id, version)
+            job.params = v.get("params", {})
+            job.output_files = v.get("output_files", [])
+            job.error_msg = v.get("error_msg", "")
+            job.created_at = v.get("created_at", group.created_at)
+            status = v.get("status")
+            if status in (JobStatus.RUNNING, JobStatus.PENDING):
+                # Jobs that were still running when the server stopped can't
+                # be resumed.
+                job.status = JobStatus.ERROR
+                job.error_msg = job.error_msg or "Interrupted by server restart."
+            else:
+                job.status = status or JobStatus.ERROR
+            _jobs[job_id] = job
+            group.versions.append(job_id)
+
+        group.versions.sort(key=lambda jid: _jobs[jid].version)
+        _groups[group_id] = group
 
 
 class _QueueWriter(io.TextIOBase):
@@ -175,6 +327,7 @@ def _worker(job: Job, args: argparse.Namespace) -> None:
         job.total_steps = args.iterations
         _push(job, {"type": "status", "status": JobStatus.RUNNING})
         _push(job, {"type": "log", "message": "Starting AutoForge pipeline…"})
+        _save_meta_for_job(job)
 
         with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
             _run(args, preview_callback=preview_cb)
@@ -192,12 +345,14 @@ def _worker(job: Job, args: argparse.Namespace) -> None:
         _push(job, {"type": "status", "status": JobStatus.DONE})
         _push(job, {"type": "done", "files": job.output_files})
         _push(job, {"type": "log", "message": "✓ Done! Click Download to get your results."})
+        _save_meta_for_job(job)
 
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
             job.status = JobStatus.CANCELLED
             _push(job, {"type": "status", "status": JobStatus.CANCELLED})
             _push(job, {"type": "log", "message": "Job was cancelled."})
+            _save_meta_for_job(job)
         else:
             _handle_error(job, exc)
 
@@ -222,6 +377,7 @@ def _handle_error(job: Job, exc: Exception) -> None:
     _push(job, {"type": "log", "message": f"ERROR: {exc}"})
     _push(job, {"type": "log", "message": tb})
     _push(job, {"type": "status", "status": JobStatus.ERROR})
+    _save_meta_for_job(job)
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +462,35 @@ def _build_args(
     )
 
 
+def _start_new_version(group: JobGroup, p: dict) -> str:
+    """Create and submit a new job version within an existing group."""
+    version = len(group.versions) + 1
+    job_id = str(uuid.uuid4())
+    output_dir = os.path.join(group.group_dir, f"v{version}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_path = _find_input(group.inputs_dir, "input_")
+    filament_path = _find_input(group.inputs_dir, "filaments")
+    pm_path = (
+        _find_input(group.inputs_dir, "priority_mask_")
+        if group.has_priority_mask
+        else None
+    )
+
+    args = _build_args(
+        output_dir, image_path, group.filament_ext, filament_path, pm_path, p
+    )
+
+    job = Job(job_id, output_dir, group.group_id, version)
+    job.params = p
+    _jobs[job_id] = job
+    group.versions.append(job_id)
+    _save_meta(group)
+
+    _executor.submit(_worker, job, args)
+    return job_id
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -329,12 +514,14 @@ async def create_job(
     except json.JSONDecodeError:
         return JSONResponse({"error": "Invalid params JSON"}, status_code=400)
 
-    job_id = str(uuid.uuid4())
-    output_dir = tempfile.mkdtemp(prefix=f"autoforge_{job_id}_")
+    group_id = str(uuid.uuid4())
+    group_dir = os.path.join(JOBS_DIR, group_id)
+    inputs_dir = os.path.join(group_dir, "inputs")
+    os.makedirs(inputs_dir, exist_ok=True)
 
-    # Save input image
-    image_fname = image.filename or "input.jpg"
-    image_path = os.path.join(output_dir, "input_" + image_fname)
+    # Save input image (basename only — never trust client-supplied paths).
+    image_fname = os.path.basename(image.filename or "input.jpg") or "input.jpg"
+    image_path = os.path.join(inputs_dir, "input_" + image_fname)
     with open(image_path, "wb") as fh:
         fh.write(await image.read())
 
@@ -342,28 +529,89 @@ async def create_job(
     fil_ext = os.path.splitext(filament_file.filename or "filaments.csv")[1].lower()
     if fil_ext not in (".csv", ".json"):
         fil_ext = ".csv"
-    filament_path = os.path.join(output_dir, "filaments" + fil_ext)
+    filament_fname = os.path.basename(filament_file.filename or ("filaments" + fil_ext))
+    filament_path = os.path.join(inputs_dir, "filaments" + fil_ext)
     with open(filament_path, "wb") as fh:
         fh.write(await filament_file.read())
 
     # Optional priority mask
-    pm_path: Optional[str] = None
+    has_priority_mask = False
     if (
         priority_mask is not None
         and priority_mask.filename
         and priority_mask.filename.strip()
     ):
-        pm_fname = priority_mask.filename
-        pm_path = os.path.join(output_dir, "priority_mask_" + pm_fname)
+        pm_fname = os.path.basename(priority_mask.filename)
+        pm_path = os.path.join(inputs_dir, "priority_mask_" + pm_fname)
         with open(pm_path, "wb") as fh:
             fh.write(await priority_mask.read())
+        has_priority_mask = True
 
-    args = _build_args(output_dir, image_path, fil_ext, filament_path, pm_path, p)
-    job = Job(job_id, output_dir)
-    _jobs[job_id] = job
-    _executor.submit(_worker, job, args)
+    group = JobGroup(
+        group_id=group_id,
+        group_dir=group_dir,
+        image_filename=image_fname,
+        filament_filename=filament_fname,
+        filament_ext=fil_ext,
+        has_priority_mask=has_priority_mask,
+    )
+    _groups[group_id] = group
 
-    return JSONResponse({"job_id": job_id})
+    job_id = _start_new_version(group, p)
+
+    return JSONResponse({"job_id": job_id, "group_id": group_id})
+
+
+@app.get("/api/history", response_class=JSONResponse)
+async def list_history() -> JSONResponse:
+    groups_out = []
+    for group in sorted(_groups.values(), key=lambda g: g.created_at, reverse=True):
+        versions = []
+        for job_id in group.versions:
+            job = _jobs.get(job_id)
+            if job is None:
+                continue
+            versions.append({
+                "job_id": job.job_id,
+                "version": job.version,
+                "status": job.status,
+                "params": job.params,
+                "output_files": job.output_files,
+                "error_msg": job.error_msg,
+                "created_at": job.created_at,
+            })
+        groups_out.append({
+            "group_id": group.group_id,
+            "created_at": group.created_at,
+            "image_filename": group.image_filename,
+            "filament_filename": group.filament_filename,
+            "has_priority_mask": group.has_priority_mask,
+            "versions": versions,
+        })
+    return JSONResponse({"groups": groups_out})
+
+
+@app.get("/api/history/{group_id}/thumbnail")
+async def get_thumbnail(group_id: str):
+    group = _groups.get(group_id)
+    if group is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path = _find_input(group.inputs_dir, "input_")
+    if not path or not os.path.isfile(path):
+        return JSONResponse({"error": "No image"}, status_code=404)
+    return FileResponse(path)
+
+
+@app.post("/api/history/{group_id}/rerun", response_class=JSONResponse)
+async def rerun_job(group_id: str, payload: dict = Body(default={})) -> JSONResponse:
+    group = _groups.get(group_id)
+    if group is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    p = payload.get("params", {}) if isinstance(payload, dict) else {}
+    if not isinstance(p, dict):
+        p = {}
+    job_id = _start_new_version(group, p)
+    return JSONResponse({"job_id": job_id, "group_id": group_id})
 
 
 @app.get("/api/jobs/{job_id}", response_class=JSONResponse)
@@ -483,6 +731,11 @@ async def ws_endpoint(ws: WebSocket, job_id: str) -> None:
     finally:
         job.queue = None
         job.loop = None
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    _load_history()
 
 
 # ---------------------------------------------------------------------------
