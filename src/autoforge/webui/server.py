@@ -630,6 +630,23 @@ async def get_job_status(job_id: str) -> JSONResponse:
     })
 
 
+@app.get("/api/jobs/{job_id}/result-image")
+async def get_result_image(job_id: str):
+    """Serve the finished job's composite preview image (final_model.png).
+
+    Used by the history panel to show a "just finished"-style preview for a
+    job that completed in a previous server session (in-memory preview_b64
+    is lost on restart, but the output file on disk is not).
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path = os.path.join(job.output_dir, "final_model.png")
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "No result image available"}, status_code=404)
+    return FileResponse(path, media_type="image/png")
+
+
 @app.get("/api/jobs/{job_id}/preview")
 async def get_preview(job_id: str):
     """Return the most recent preview JPEG (for reconnecting clients)."""

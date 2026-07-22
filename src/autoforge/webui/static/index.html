@@ -185,6 +185,14 @@
       border: 1px solid var(--border);
       border-radius: var(--radius);
       overflow: hidden;
+      /* #main is a flex column; flex items default to a content-based
+         min-height *unless* they have overflow != visible, in which case
+         their automatic minimum size becomes 0. Since .card sets
+         overflow:hidden, without flex-shrink:0 the flexbox algorithm is
+         allowed to squash cards below their content height (clipping e.g.
+         the download button in #log-card) instead of letting #main grow
+         and scroll. */
+      flex-shrink: 0;
     }
     .card-header {
       padding: 10px 14px;
@@ -336,7 +344,12 @@
       align-items: center;
       gap: 6px;
       font-size: 12px;
+      cursor: pointer;
+      border-radius: 4px;
+      padding: 2px 4px;
+      transition: background .15s;
     }
+    .history-version:hover { background: rgba(255,255,255,0.05); }
     .history-version-num { color: var(--text-dim); }
     .history-version-actions { display: flex; gap: 4px; margin-left: auto; }
     .history-btn { padding: 3px 8px !important; font-size: 11px !important; }
@@ -943,13 +956,13 @@ function renderHistory(groups) {
   const labels = { running: 'Running', done: 'Done', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
   el.innerHTML = groups.map(g => {
     const versionsHtml = g.versions.slice().reverse().map(v => `
-      <div class="history-version">
+      <div class="history-version" title="Click to view this job's result" onclick="viewHistoryVersion('${g.group_id}','${v.job_id}')">
         <span class="badge badge-${v.status}">${labels[v.status] || v.status}</span>
         <span class="history-version-num">v${v.version}</span>
         <div class="history-version-actions">
-          <button class="btn btn-secondary history-btn" title="Load these settings for editing" onclick="loadSettingsFromVersion('${g.group_id}','${v.job_id}')">✎ Edit</button>
+          <button class="btn btn-secondary history-btn" title="Load these settings for editing" onclick="event.stopPropagation(); loadSettingsFromVersion('${g.group_id}','${v.job_id}')">✎ Edit</button>
           ${v.status === 'done'
-            ? `<a class="btn btn-secondary history-btn" style="text-decoration:none;" title="Download this version" href="/api/jobs/${v.job_id}/download">⬇</a>`
+            ? `<a class="btn btn-secondary history-btn" style="text-decoration:none;" title="Download this version" href="/api/jobs/${v.job_id}/download" onclick="event.stopPropagation()">⬇</a>`
             : ''}
         </div>
       </div>
@@ -991,6 +1004,62 @@ async function loadSettingsFromVersion(groupId, jobId) {
   activeGroupId = groupId;
   activeGroupLabel = group.image_filename;
   updateEditingBanner();
+}
+
+// ── View a historical job's result in the right-hand panel ─────────────────
+// Makes clicking a past job show the same preview/progress/log/download UI
+// that appears when a job has just finished running.
+async function viewHistoryVersion(groupId, jobId) {
+  let data = historyCache;
+  if (!data) {
+    const r = await fetch('/api/history');
+    if (!r.ok) return;
+    data = await r.json();
+    historyCache = data;
+  }
+  const group = (data.groups || []).find(g => g.group_id === groupId);
+  if (!group) return;
+  const version = group.versions.find(v => v.job_id === jobId);
+  if (!version) return;
+
+  // Stop following any currently-connected job before switching the view.
+  if (ws) { ws.close(); ws = null; }
+  currentJobId = jobId;
+  setRunning(false);
+
+  clearLog();
+  resetPreview();
+  hideDownload();
+  showCards(true);
+
+  const labels = { running: 'Running', done: 'Done ✓', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
+  setBadge(version.status, labels[version.status] || version.status);
+
+  const bar = document.getElementById('progress-bar');
+  bar.classList.remove('pruning');
+  bar.style.width = version.status === 'done' ? '100%' : '0%';
+  document.getElementById('progress-info').textContent =
+    version.status === 'done' ? 'Complete' : (labels[version.status] || version.status);
+  document.getElementById('preview-label').textContent = `v${version.version} — ${group.image_filename}`;
+
+  appendLog(`Loaded v${version.version} (${labels[version.status] || version.status}) from job history.`);
+  if (version.error_msg) appendLog('ERROR: ' + version.error_msg, 'error');
+
+  if (version.status === 'done') {
+    const img = document.getElementById('preview-img');
+    const ph  = document.getElementById('preview-placeholder');
+    img.onload  = () => { img.style.display = 'block'; ph.style.display = 'none'; };
+    img.onerror = () => { img.style.display = 'none'; ph.style.display = 'block'; ph.textContent = 'No preview image available.'; };
+    img.src = `/api/jobs/${jobId}/result-image?t=${Date.now()}`;
+
+    const dl = document.getElementById('btn-download');
+    dl.href = `/api/jobs/${jobId}/download`;
+    document.getElementById('file-list').textContent = 'Files: ' + (version.output_files || []).join(', ');
+    document.getElementById('download-row').style.display = 'flex';
+  } else {
+    document.getElementById('preview-placeholder').textContent =
+      version.status === 'error' ? 'This job did not complete successfully.' : 'No preview available for this job.';
+  }
 }
 
 function applyParams(params) {
