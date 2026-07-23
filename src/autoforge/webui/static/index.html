@@ -408,13 +408,17 @@
         📁 Files <span class="chevron">▶</span>
       </div>
       <div class="section-body">
-        <div class="field">
+        <div class="field" id="image-field">
           <label>Input Image <span style="color:#f85149">*</span></label>
           <div class="dropzone" id="dz-image">
             <input type="file" id="input-image" accept="image/*" />
             <div class="dz-icon">🖼</div>
             <div class="dz-label">Click or drag an image here</div>
             <div class="dz-name" id="dz-image-name"></div>
+          </div>
+          <div id="image-editing-info" class="row" style="display:none">
+            <span class="hint">Using image from history: <strong id="image-editing-name"></strong></span>
+            <button type="button" class="btn btn-secondary" style="padding:3px 8px;font-size:11px;" onclick="revealImageDropzone()">Change image</button>
           </div>
         </div>
         <div class="field">
@@ -434,6 +438,30 @@
             <div class="dz-label">Grayscale mask — brighter = more detail</div>
             <div class="dz-name" id="dz-mask-name"></div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profiles -->
+    <div class="section open" id="sec-profiles">
+      <div class="section-header" onclick="toggleSection('sec-profiles')">
+        🧩 Profiles <span class="chevron">▶</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Load a saved profile</label>
+          <select id="profile-select" onchange="onProfileSelected()">
+            <option value="">— Select profile —</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Save current settings as…</label>
+          <div class="row">
+            <input type="text" id="profile-name-input" placeholder="Profile name" style="flex:1" />
+            <button type="button" class="btn btn-secondary" onclick="saveProfile()">💾 Save</button>
+            <button type="button" class="btn btn-danger" onclick="deleteProfile()">🗑</button>
+          </div>
+          <span class="hint">Profiles save all settings on this page (not the uploaded files) in this browser, so you can quickly re-apply a parameter set to a new image.</span>
         </div>
       </div>
     </div>
@@ -751,14 +779,18 @@ function toggleSection(id) {
 }
 
 // ── File drop zones ────────────────────────────────────────────────────────
-function setupDropzone(dzId, inputId, nameId) {
+function setupDropzone(dzId, inputId, nameId, onFile) {
   const dz = document.getElementById(dzId);
   const input = document.getElementById(inputId);
   const nameEl = document.getElementById(nameId);
 
-  input.addEventListener('change', () => {
-    if (input.files[0]) nameEl.textContent = input.files[0].name;
-  });
+  const handleFile = file => {
+    if (!file) return;
+    nameEl.textContent = file.name;
+    if (onFile) onFile(file);
+  };
+
+  input.addEventListener('change', () => handleFile(input.files[0]));
   dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
   dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
   dz.addEventListener('drop', e => {
@@ -769,13 +801,22 @@ function setupDropzone(dzId, inputId, nameId) {
       const dt = new DataTransfer();
       dt.items.add(files[0]);
       input.files = dt.files;
-      nameEl.textContent = files[0].name;
+      handleFile(files[0]);
     }
   });
 }
-setupDropzone('dz-image', 'input-image', 'dz-image-name');
+// Uploading a new image always means "start a new job from scratch", so
+// picking one while editing a past job's settings drops out of edit mode.
+setupDropzone('dz-image', 'input-image', 'dz-image-name', () => {
+  if (activeGroupId) cancelEditing();
+});
 setupDropzone('dz-filament', 'input-filament', 'dz-filament-name');
 setupDropzone('dz-mask', 'input-mask', 'dz-mask-name');
+
+function revealImageDropzone() {
+  document.getElementById('dz-image').style.display = '';
+  document.getElementById('image-editing-info').style.display = 'none';
+}
 
 // ── Color picker sync ──────────────────────────────────────────────────────
 const colorPicker = document.getElementById('p-background_color-picker');
@@ -858,7 +899,7 @@ async function startJob() {
   // A fresh upload always starts a brand-new history entry.
   activeGroupId = null;
   activeGroupLabel = null;
-  updateEditingBanner();
+  updateEditModeUI();
 
   setRunning(true);
   clearLog();
@@ -956,11 +997,10 @@ function renderHistory(groups) {
   const labels = { running: 'Running', done: 'Done', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
   el.innerHTML = groups.map(g => {
     const versionsHtml = g.versions.slice().reverse().map(v => `
-      <div class="history-version" title="Click to view this job's result" onclick="viewHistoryVersion('${g.group_id}','${v.job_id}')">
+      <div class="history-version" title="Click to view results and load these settings for editing" onclick="openHistoryJob('${g.group_id}','${v.job_id}')">
         <span class="badge badge-${v.status}">${labels[v.status] || v.status}</span>
         <span class="history-version-num">v${v.version}</span>
         <div class="history-version-actions">
-          <button class="btn btn-secondary history-btn" title="Load these settings for editing" onclick="event.stopPropagation(); loadSettingsFromVersion('${g.group_id}','${v.job_id}')">✎ Edit</button>
           ${v.status === 'done'
             ? `<a class="btn btn-secondary history-btn" style="text-decoration:none;" title="Download this version" href="/api/jobs/${v.job_id}/download" onclick="event.stopPropagation()">⬇</a>`
             : ''}
@@ -987,7 +1027,9 @@ function renderHistory(groups) {
   }).join('');
 }
 
-async function loadSettingsFromVersion(groupId, jobId) {
+// ── Open a historical job: load its settings for editing AND show its
+// result/progress in the right-hand panel (clicking a job = edit + view). ──
+async function openHistoryJob(groupId, jobId) {
   let data = historyCache;
   if (!data) {
     const r = await fetch('/api/history');
@@ -1000,37 +1042,18 @@ async function loadSettingsFromVersion(groupId, jobId) {
   const version = group.versions.find(v => v.job_id === jobId);
   if (!version) return;
 
+  // Enter edit mode: load this version's settings and remember the group so
+  // Run creates a new version reusing its original inputs.
   applyParams(version.params || {});
-
-  // Clear any freshly-picked files — the re-run reuses the original inputs.
   ['input-image', 'input-filament', 'input-mask'].forEach(id => { document.getElementById(id).value = ''; });
   ['dz-image-name', 'dz-filament-name', 'dz-mask-name'].forEach(id => { document.getElementById(id).textContent = ''; });
-
   activeGroupId = groupId;
   activeGroupLabel = group.image_filename;
-  updateEditingBanner();
-}
-
-// ── View a historical job's result in the right-hand panel ─────────────────
-// Makes clicking a past job show the same preview/progress/log/download UI
-// that appears when a job has just finished running.
-async function viewHistoryVersion(groupId, jobId) {
-  let data = historyCache;
-  if (!data) {
-    const r = await fetch('/api/history');
-    if (!r.ok) return;
-    data = await r.json();
-    historyCache = data;
-  }
-  const group = (data.groups || []).find(g => g.group_id === groupId);
-  if (!group) return;
-  const version = group.versions.find(v => v.job_id === jobId);
-  if (!version) return;
+  updateEditModeUI();
 
   // Stop following any currently-connected job before switching the view.
   if (ws) { ws.close(); ws = null; }
   currentJobId = jobId;
-  setRunning(false);
 
   clearLog();
   resetPreview();
@@ -1039,16 +1062,37 @@ async function viewHistoryVersion(groupId, jobId) {
 
   const labels = { running: 'Running', done: 'Done ✓', error: 'Error', cancelled: 'Cancelled', pending: 'Pending' };
   setBadge(version.status, labels[version.status] || version.status);
+  document.getElementById('preview-label').textContent = `v${version.version} — ${group.image_filename}`;
+
+  const active = version.status === 'running' || version.status === 'pending';
+  setRunning(active);
+
+  if (active) {
+    // Live job: reconnecting the WebSocket replays every buffered message
+    // (log lines, progress, preview frames) since the job started, then
+    // keeps streaming further updates — so this naturally restores the
+    // exact current state instead of showing a blank/placeholder panel.
+    appendLog(`Reconnected to v${version.version} (${labels[version.status]}).`);
+    connectWS(jobId);
+    return;
+  }
 
   const bar = document.getElementById('progress-bar');
   bar.classList.remove('pruning');
   bar.style.width = version.status === 'done' ? '100%' : '0%';
   document.getElementById('progress-info').textContent =
     version.status === 'done' ? 'Complete' : (labels[version.status] || version.status);
-  document.getElementById('preview-label').textContent = `v${version.version} — ${group.image_filename}`;
 
-  appendLog(`Loaded v${version.version} (${labels[version.status] || version.status}) from job history.`);
-  if (version.error_msg) appendLog('ERROR: ' + version.error_msg, 'error');
+  // Finished job: pull the persisted log from disk — the in-memory message
+  // buffer used by the live WebSocket does not survive a server restart,
+  // but the log file does.
+  try {
+    const lr = await fetch(`/api/jobs/${jobId}/log`);
+    if (lr.ok) {
+      const { log } = await lr.json();
+      if (log) log.split('\n').filter(Boolean).forEach(line => appendLog(line, line.startsWith('ERROR') ? 'error' : undefined));
+    }
+  } catch (_) { /* ignore */ }
 
   if (version.status === 'done') {
     const img = document.getElementById('preview-img');
@@ -1112,6 +1156,62 @@ async function deleteGroup(groupId) {
   loadHistory();
 }
 
+// ── User-defined profiles (saved parameter sets) ────────────────────────────
+// Stored client-side (localStorage) so a user can build up their own set of
+// preconfigured parameter bundles and quickly re-apply one after uploading a
+// new image/filament pair, without needing any server-side storage.
+const PROFILES_KEY = 'autoforge_profiles_v1';
+
+function loadProfiles() {
+  try { return JSON.parse(localStorage.getItem(PROFILES_KEY) || '{}'); }
+  catch (_) { return {}; }
+}
+
+function persistProfiles(profiles) {
+  localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+}
+
+function renderProfileOptions(selected) {
+  const sel = document.getElementById('profile-select');
+  const profiles = loadProfiles();
+  const names = Object.keys(profiles).sort((a, b) => a.localeCompare(b));
+  sel.innerHTML = '<option value="">— Select profile —</option>' +
+    names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+  if (selected && names.includes(selected)) sel.value = selected;
+}
+
+function onProfileSelected() {
+  const name = document.getElementById('profile-select').value;
+  if (!name) return;
+  const profiles = loadProfiles();
+  if (profiles[name]) {
+    applyParams(profiles[name]);
+    document.getElementById('profile-name-input').value = name;
+  }
+}
+
+function saveProfile() {
+  const name = document.getElementById('profile-name-input').value.trim();
+  if (!name) { alert('Enter a name for this profile.'); return; }
+  const profiles = loadProfiles();
+  profiles[name] = getParams();
+  persistProfiles(profiles);
+  renderProfileOptions(name);
+}
+
+function deleteProfile() {
+  const sel = document.getElementById('profile-select');
+  const name = sel.value || document.getElementById('profile-name-input').value.trim();
+  if (!name) { alert('Select a profile to delete.'); return; }
+  const profiles = loadProfiles();
+  if (!profiles[name]) { alert('No such saved profile.'); return; }
+  if (!confirm(`Delete profile "${name}"?`)) return;
+  delete profiles[name];
+  persistProfiles(profiles);
+  renderProfileOptions();
+  document.getElementById('profile-name-input').value = '';
+}
+
 function applyParams(params) {
   const setBool = (id, v) => { if (v === undefined) return; const el = document.getElementById(id); if (el) el.checked = !!v; };
   const setVal  = (id, v) => { if (v === undefined || v === null) return; const el = document.getElementById(id); if (el) el.value = v; };
@@ -1157,26 +1257,34 @@ function applyParams(params) {
   setBool('p-mps', params.mps);
 }
 
-function updateEditingBanner() {
+function updateEditModeUI() {
   const banner = document.getElementById('editing-banner');
   const runBtn = document.getElementById('btn-run');
+  const dz = document.getElementById('dz-image');
+  const info = document.getElementById('image-editing-info');
   if (activeGroupId) {
     banner.style.display = 'flex';
     document.getElementById('editing-label').textContent = activeGroupLabel || '';
     runBtn.textContent = '▶ Run New Version';
+    dz.style.display = 'none';
+    info.style.display = '';
+    document.getElementById('image-editing-name').textContent = activeGroupLabel || '';
   } else {
     banner.style.display = 'none';
     runBtn.textContent = '▶ Run AutoForge';
+    dz.style.display = '';
+    info.style.display = 'none';
   }
 }
 
 function cancelEditing() {
   activeGroupId = null;
   activeGroupLabel = null;
-  updateEditingBanner();
+  updateEditModeUI();
 }
 
 loadHistory();
+renderProfileOptions();
 
 // ── Cancel ─────────────────────────────────────────────────────────────────
 async function cancelJob() {

@@ -136,14 +136,37 @@ class Job:
         self.cancel_event: threading.Event = threading.Event()
         self.output_files: List[str] = []
 
+    @property
+    def log_path(self) -> str:
+        return os.path.join(self.output_dir, "job.log")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _append_log_line(job: Job, text: str) -> None:
+    """Persist a log/error line to disk so it survives server restarts.
+
+    Only "log"/"error" message text is written here (not progress/preview
+    messages, which are frequent and — for previews — large base64 blobs
+    unsuitable for a plain-text, ever-growing file).
+    """
+    try:
+        os.makedirs(job.output_dir, exist_ok=True)
+        with open(job.log_path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+
+
 def _push(job: Job, msg: dict) -> None:
     """Thread-safe: buffer the message and forward it to any open WebSocket."""
     job.messages.append(msg)
+    if msg.get("type") in ("log", "error"):
+        text = msg.get("message", "")
+        if text:
+            _append_log_line(job, text)
     if job.loop is not None and job.queue is not None:
         try:
             job.loop.call_soon_threadsafe(job.queue.put_nowait, msg)
@@ -731,6 +754,23 @@ async def get_result_image(job_id: str):
     if not os.path.isfile(path):
         return JSONResponse({"error": "No result image available"}, status_code=404)
     return FileResponse(path, media_type="image/png")
+
+
+@app.get("/api/jobs/{job_id}/log", response_class=JSONResponse)
+async def get_job_log(job_id: str) -> JSONResponse:
+    """Return the full persisted log text for a job.
+
+    Used by the history panel to show complete logs for a job that finished
+    in a previous server session — the in-memory message buffer used by the
+    live WebSocket does not survive a server restart, but this file does.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if not os.path.isfile(job.log_path):
+        return JSONResponse({"log": ""})
+    with open(job.log_path, encoding="utf-8") as fh:
+        return JSONResponse({"log": fh.read()})
 
 
 @app.get("/api/jobs/{job_id}/preview")
