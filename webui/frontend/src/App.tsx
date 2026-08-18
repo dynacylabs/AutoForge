@@ -71,7 +71,7 @@ const App: React.FC = () => {
           <FilamentLibrary />
         </aside>
 
-        <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           <div style={{ flex: 1, display: 'flex', gap: 8, padding: 8, minHeight: 0 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <InputImagePanel />
@@ -88,7 +88,7 @@ const App: React.FC = () => {
             Mesh Height: {currentMeshHeight.toFixed(2)}/{totalMeshHeight.toFixed(2)}mm
           </div>
 
-          <div style={{ height: 178, flexShrink: 0, borderTop: '1px solid var(--border)' }}>
+          <div style={{ height: 178, flexShrink: 0, minWidth: 0, overflow: 'hidden', borderTop: '1px solid var(--border)' }}>
             <ColorSliders />
           </div>
         </main>

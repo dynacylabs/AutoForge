@@ -1,18 +1,27 @@
 """Derive the ColorSlider stack from a discrete optimization solution.
 
-The WebUI represents the print as a HueForge-style stack of up to 15 material
-"sliders".  Each slider is a filament (material) occupying a contiguous range
-of print layers; the slider's ``layer`` value is the top layer of its range.
+The WebUI represents the print as a HueForge-style stack of material
+"sliders" — one per contiguous run of print layers using the same material.
 The stack is read off the optimizer's discrete solution:
 
 * ``disc_global`` is a 1D array of material indices, one per print layer.
 * ``disc_height_image`` is the per-pixel height map (in layers); its
   min/max bound the layer range the sliders are allowed to occupy.
+
+The number of sliders is *not* capped: the optimizer can legitimately
+produce more (or fewer) than any fixed UI column count — a material can
+recur in several non-contiguous layer bands, and pruning further changes
+the band count. Truncating or merging bands here would silently discard
+part of the real result, and since ``render_with_sliders`` reconstructs the
+whole composite/mesh from exactly this slider list, a truncated stack
+doesn't just mis-render the UI — it produces a genuinely different (wrong)
+3D preview the moment anything re-triggers that reconstruction. The
+frontend is responsible for displaying however many columns this returns
+(with horizontal scrolling), not this module for pretending there are
+fewer than there really are.
 """
 
 import numpy as np
-
-DEFAULT_MAX_SLIDERS = 15
 
 
 def _slider_dict(
@@ -38,7 +47,6 @@ def derive_sliders_from_optimizer(
     material_tds: np.ndarray,
     material_uuids: list,
     layer_height: float,
-    max_sliders: int = DEFAULT_MAX_SLIDERS,
 ):
     """Return ``{"sliders": [...], "min_layer": int, "max_layer": int}``.
 
@@ -73,28 +81,6 @@ def derive_sliders_from_optimizer(
     if current_material is not None:
         segments.append([current_material, start, n_stack])
 
-    # Merge the smallest adjacent segments until we fit within the UI columns.
-    while len(segments) > max_sliders:
-        smallest = None
-        best_span = float("inf")
-        for i in range(len(segments) - 1):
-            span = segments[i + 1][2] - segments[i][1] + 1
-            if span < best_span:
-                best_span = span
-                smallest = i
-        if smallest is None:
-            break
-        left = segments[smallest]
-        right = segments[smallest + 1]
-        left_span = left[2] - left[1] + 1
-        right_span = right[2] - right[1] + 1
-        # Keep the material of the larger span; the merged region spans both.
-        if right_span > left_span:
-            merged = [right[0], left[1], right[2]]
-        else:
-            merged = [left[0], left[1], right[2]]
-        segments[smallest : smallest + 2] = [merged]
-
     sliders = [
         _slider_dict(material, end, layer_height, material_tds, material_uuids)
         for material, _start, end in segments
@@ -103,7 +89,7 @@ def derive_sliders_from_optimizer(
     return {"sliders": sliders, "min_layer": min_layer, "max_layer": max_layer}
 
 
-def derive_sliders_from_result(result: dict, max_sliders: int = DEFAULT_MAX_SLIDERS):
+def derive_sliders_from_result(result: dict):
     """Derive sliders from a pipeline result dict (see ``run_pipeline``)."""
     optimizer = result["optimizer"]
     material_tds = result.get("material_TDs_np")
@@ -114,5 +100,5 @@ def derive_sliders_from_result(result: dict, max_sliders: int = DEFAULT_MAX_SLID
         num_materials = int(optimizer.material_colors.shape[0])
         material_tds = np.zeros(num_materials, dtype=np.float64)
     return derive_sliders_from_optimizer(
-        optimizer, material_tds, material_uuids, layer_height, max_sliders
+        optimizer, material_tds, material_uuids, layer_height
     )

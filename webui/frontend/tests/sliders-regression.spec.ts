@@ -126,7 +126,11 @@ test('sliders and color core stay populated after optimization and pruning (live
   // the invariant (sliders present with a real derived range) rather than exact
   // values: the default sliderLayerRange max is 75, so a non-"75" max proves a
   // solution-derived range was applied instead of leaving the store untouched.
-  await expect(page.locator('[data-testid^="slider-column-"]')).toHaveCount(15, { timeout: 30000 })
+  // The column count is NOT fixed at 15 — it matches however many distinct
+  // layer bands the optimizer actually produced (can be more or fewer), so
+  // just assert that some real columns showed up.
+  await expect(page.locator('[data-testid^="slider-column-"]').first()).toBeVisible({ timeout: 30000 })
+  expect(await page.locator('[data-testid^="slider-column-"]').count()).toBeGreaterThan(0)
   await expect(page.locator('[data-testid^="color-core-handle-"]').first()).toBeVisible({ timeout: 30000 })
   const optimizeMax = await page.locator('[data-testid="slider-0"]').getAttribute('max')
   expect(optimizeMax).not.toBe('75')
@@ -140,9 +144,12 @@ test('sliders and color core stay populated after optimization and pruning (live
   const pruneResult = await waitForStatus(request, (await pruneResp.json()).job_id)
   expect(pruneResult.status).toBe('completed')
 
-  // Sliders must still be present after pruning completes.
+  // Sliders must still be present after pruning completes — again, however
+  // many bands pruning left (pruning_max_colors=4 above bounds it, but not
+  // to exactly any fixed UI column count).
   const columns = page.locator('[data-testid^="slider-column-"]')
-  await expect(columns).toHaveCount(15, { timeout: 30000 })
+  await expect(columns.first()).toBeVisible({ timeout: 30000 })
+  expect(await columns.count()).toBeGreaterThan(0)
   const handles = page.locator('[data-testid^="color-core-handle-"]')
   expect(await handles.count()).toBeGreaterThan(0)
 
@@ -170,4 +177,64 @@ test('sliders and color core stay populated after optimization and pruning (live
     expect(v.layer).toBeGreaterThanOrEqual(v.min)
     expect(v.layer).toBeLessThanOrEqual(v.max)
   }
+})
+
+test('slider column count is not capped at 15 — it matches the real result exactly, with horizontal scroll', async ({ page, request }) => {
+  // Regression test: the backend used to merge segments down to a fixed 15
+  // and the frontend separately padded/truncated to 15 too, so a result
+  // with a different number of real layer bands than 15 got silently
+  // rewritten — and since render-with-sliders reconstructs the whole
+  // composite/mesh from exactly this slider list, that didn't just mis-draw
+  // the UI, it changed the actual 3D preview colors. Neither cap exists
+  // anymore; the UI must show exactly what the backend derives.
+  const active = await request.get('/api/filaments/active')
+  for (const f of await active.json()) {
+    await request.delete(`/api/filaments/active/${f.uuid}`)
+  }
+
+  const upload = await request.post('/api/images/upload', {
+    multipart: { file: { name: 'quad2.png', mimeType: 'image/png', buffer: PNG } },
+  })
+  const filename = (await upload.json()).filename
+
+  for (const [name, color, td] of [
+    ['Red', '#FF0000', 1.0], ['Green', '#00FF00', 2.0], ['Blue', '#0000FF', 3.0],
+    ['Yellow', '#FFFF00', 4.0],
+  ]) {
+    const created = await request.post('/api/filaments', { data: { brand: 'E2E', name, color, td, filament_type: 'PLA' } })
+    const filament = await created.json()
+    await request.post('/api/filaments/active', { data: filament })
+  }
+
+  await page.goto('/')
+
+  const start = await request.post('/api/optimize/start', {
+    data: {
+      input_image: filename, iterations: 4, max_layers: 12, layer_height: 0.04,
+      background_height: 0.12, stl_output_size: 20, processing_reduction_factor: 1,
+      random_seed: 42, num_init_rounds: 1, num_init_cluster_layers: 4, learning_rate: 0.01,
+      init_tau: 1.0, final_tau: 0.5, early_stopping: 1000, visualize: false,
+      perform_pruning: false, best_of: 1, discrete_check: 1, csv_file: '', json_file: '',
+    },
+  })
+  expect(start.ok()).toBeTruthy()
+  const jobId = (await start.json()).job_id
+  const result = await waitForStatus(request, jobId)
+  expect(result.status).toBe('completed')
+
+  // Ask the backend directly for the derived slider stack — the authority
+  // on how many bands the real solution has — and compare against the UI.
+  const derived = await (await request.get('/api/sliders/from-optimizer')).json()
+  const expectedCount = derived.sliders.length
+  expect(expectedCount).toBeGreaterThan(0)
+
+  await expect(page.locator('[data-testid^="slider-column-"]').first()).toBeVisible({ timeout: 30000 })
+  await expect(page.locator('[data-testid^="slider-column-"]')).toHaveCount(expectedCount, { timeout: 10000 })
+
+  // The scroll container must actually allow horizontal scrolling (not
+  // clip or wrap) so a count that overflows the panel width stays usable.
+  const overflowX = await page.locator('[data-testid="slider-columns"]').evaluate(
+    (el) => getComputedStyle(el).overflowX,
+  )
+  expect(overflowX).toBe('auto')
 })

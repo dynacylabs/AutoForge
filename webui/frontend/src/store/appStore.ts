@@ -180,17 +180,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   setSliders: (sliders) => { set({ colorSliders: sliders }); queueCaptureSnapshot() },
   applySliders: (sliders, range) => {
     set((state) => {
-      // Normalize to 15 columns: copy the incoming sliders, then disable any
-      // leftover columns so they no longer show handles in the color core.
-      const incoming = sliders.slice(0, 15)
-      const current = state.colorSliders
-      const merged = incoming.map((s, i) => ({ ...(current[i] ?? {}), ...s }))
-      while (merged.length < 15) {
-        merged.push({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })
-      }
-      for (let i = incoming.length; i < 15; i++) {
-        merged[i] = { ...merged[i], enabled: false, layer: 0 }
-      }
+      // The optimizer/pruner can legitimately produce more or fewer bands
+      // than any fixed column count — a material can recur in several
+      // non-contiguous layer bands, and pruning changes the band count
+      // further. Show exactly what it produced; padding to (or truncating
+      // at) a fixed number here previously threw away real segments, which
+      // then made the *next* render-with-sliders reconstruction (driven by
+      // this same list) visibly wrong versus the true discrete solution.
+      const merged = sliders.map((s, i) => ({ ...(state.colorSliders[i] ?? {}), ...s }))
       return {
         colorSliders: merged,
         ...(range && Number.isFinite(range.min) && Number.isFinite(range.max)

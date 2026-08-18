@@ -86,12 +86,14 @@ export const ColorSliders: React.FC = () => {
       <div style={{ padding: '4px 8px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <h3 style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>Color Sliders</h3>
         <span style={{ fontSize: 10, color: 'var(--text-secondary)' }} data-testid="slider-render-status">
-          {isRendering ? 'Rendering…' : '15 columns'}
+          {isRendering ? 'Rendering…' : `${colorSliders.length} column${colorSliders.length === 1 ? '' : 's'}`}
         </span>
       </div>
 
-      {/* Sliders */}
-      <div style={{ display: 'flex', gap: 2, padding: 4 }} data-testid="slider-columns">
+      {/* Sliders — however many the optimizer/pruner actually produced, not
+          a fixed count, so this scrolls horizontally instead of clipping or
+          padding out fake empty columns. */}
+      <div style={{ display: 'flex', gap: 2, padding: 4, overflowX: 'auto', overflowY: 'hidden' }} data-testid="slider-columns">
         {colorSliders.map((slider, i) => {
           const filament = findFilament(slider.filament_uuid)
           const color = filament?.color ?? '#333333'
@@ -99,7 +101,7 @@ export const ColorSliders: React.FC = () => {
           return (
             <div
               key={i}
-              style={{ width: 50, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, fontSize: 10 }}
+              style={{ width: 50, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, fontSize: 10 }}
               onDrop={(e) => handleDrop(e, i)}
               onDragOver={handleDragOver}
               data-testid={`slider-column-${i}`}
