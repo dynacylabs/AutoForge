@@ -1,0 +1,104 @@
+import { useCallback, useEffect, useRef } from 'react'
+import { useAppStore } from '../store/appStore'
+import type { Filament } from '../types'
+
+const MAX_RETRIES = 10
+const RETRY_DELAY = 2000 // ms
+
+async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<Response> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const resp = await fetch(url)
+      if (resp.ok) return resp
+    } catch {
+      // Backend not ready yet
+    }
+    if (attempt < retries - 1) {
+      await new Promise(r => setTimeout(r, RETRY_DELAY))
+    }
+  }
+  throw new Error(`Backend unreachable: ${url}`)
+}
+
+export async function loadFilaments() {
+  try {
+    const state = useAppStore.getState()
+    const params = new URLSearchParams()
+    if (state.activeTab) params.set('filament_type', state.activeTab)
+    if (state.filterBrand) params.set('brand', state.filterBrand)
+    if (state.filterQuery) params.set('query', state.filterQuery)
+
+    const response = await fetchWithRetry(`/api/filaments?${params.toString()}`, 1)
+    const filaments: Filament[] = await response.json()
+    useAppStore.getState().setFilaments(filaments)
+  } catch {
+    // Backend unreachable – show empty list
+  }
+}
+
+export async function loadFilamentTypes() {
+  try {
+    const response = await fetchWithRetry('/api/filaments/types', 1)
+    const types: string[] = await response.json()
+    useAppStore.getState().setFilamentTypes(types)
+    if (types.length > 0 && !useAppStore.getState().activeTab) {
+      useAppStore.getState().setActiveTab(types[0])
+    }
+  } catch {
+    // Backend unreachable
+  }
+}
+
+export async function loadFilamentBrands() {
+  try {
+    const state = useAppStore.getState()
+    const params = new URLSearchParams()
+    if (state.activeTab) params.set('filament_type', state.activeTab)
+    const response = await fetchWithRetry(`/api/filaments/brands?${params.toString()}`, 1)
+    const brands: string[] = await response.json()
+    useAppStore.getState().setFilamentBrands(brands)
+  } catch {
+    // Backend unreachable
+  }
+}
+
+export function useFilamentLoader() {
+  const activeTab = useAppStore((s) => s.activeTab)
+  const filterBrand = useAppStore((s) => s.filterBrand)
+  const filterQuery = useAppStore((s) => s.filterQuery)
+  const initialLoadDone = useRef(false)
+
+  const load = useCallback(async () => {
+    // On initial load, retry until backend responds
+    const retries = initialLoadDone.current ? 1 : 10
+    initialLoadDone.current = true
+
+    try {
+      const response = await fetchWithRetry('/api/filaments/types', retries)
+      const types: string[] = await response.json()
+      const store = useAppStore.getState()
+      store.setFilamentTypes(types)
+      if (types.length > 0 && !store.activeTab) {
+        store.setActiveTab(types[0])
+      }
+    } catch {
+      // Still no backend – leave empty
+    }
+
+    try {
+      await loadFilaments()
+      await loadFilamentBrands()
+    } catch {
+      // Ignore
+    }
+  }, [])
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  useEffect(() => {
+    loadFilaments()
+    loadFilamentBrands()
+  }, [activeTab, filterBrand, filterQuery])
+}

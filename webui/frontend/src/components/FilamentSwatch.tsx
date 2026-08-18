@@ -1,0 +1,96 @@
+import React from 'react'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip'
+import { contrastTextColor, normalizeHex } from '../lib/color'
+import type { Filament } from '../types'
+
+interface FilamentSwatchProps {
+  filament: Filament
+  size?: 'sm' | 'md' | 'lg'
+  showLabel?: boolean
+  onClick?: () => void
+  onDragStart?: (e: React.DragEvent) => void
+  selected?: boolean
+}
+
+const sizeMap = {
+  sm: { swatch: 'w-8 h-4', text: 'text-[10px]', label: 'text-[10px]' },
+  md: { swatch: 'w-12 h-6', text: 'text-xs', label: 'text-xs' },
+  lg: { swatch: 'w-16 h-8', text: 'text-sm', label: 'text-sm' },
+}
+
+export const FilamentSwatch: React.FC<FilamentSwatchProps> = ({
+  filament,
+  size = 'md',
+  showLabel = true,
+  onClick,
+  onDragStart,
+  selected = false,
+}) => {
+  const sizeStyle = sizeMap[size]
+  const textColor = contrastTextColor(filament.color)
+  const label = filament.name || normalizeHex(filament.color)
+
+  const widthRem = parseInt(sizeStyle.swatch.match(/w-(\d+)/)?.[1] ?? '12', 10) * 4
+  const heightRem = parseInt(sizeStyle.swatch.match(/h-(\d+)/)?.[1] ?? '6', 10) * 4
+
+  const swatch = (
+    <div
+      className={`relative flex items-center justify-center rounded cursor-default select-none ${
+        selected ? 'ring-2 ring-primary ring-offset-1 ring-offset-background' : ''
+      }`}
+      style={{
+        backgroundColor: filament.color,
+        width: `${widthRem}px`,
+        height: `${heightRem}px`,
+        borderRadius: '4px',
+        overflow: 'hidden',
+        flexShrink: 0,
+      }}
+      draggable={!!onDragStart}
+      onDragStart={onDragStart}
+      onClick={onClick}
+    >
+      {filament.td !== undefined && (
+        <span
+          className={`font-mono font-bold ${sizeStyle.text}`}
+          style={{ color: textColor, textShadow: `0 0 2px rgba(0,0,0,0.5)` }}
+        >
+          {filament.td}
+        </span>
+      )}
+    </div>
+  )
+
+  if (!showLabel) {
+    return (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>{swatch}</TooltipTrigger>
+          <TooltipContent side="top" className="text-xs">
+            <div>{label}</div>
+            <div>TD: {filament.td?.toFixed(1)}</div>
+            <div>{normalizeHex(filament.color)}</div>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      {swatch}
+      {showLabel && (
+        <div className="flex flex-col min-w-0">
+          <span className={`truncate ${sizeStyle.label} text-foreground`}>
+            {label}
+          </span>
+          {filament.brand && (
+            <span className="text-[10px] text-muted-foreground truncate">
+              {filament.brand} · {filament.filament_type}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

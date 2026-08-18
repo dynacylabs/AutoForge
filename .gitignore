@@ -176,6 +176,17 @@ cython_debug/
 # Runtime data
 filament_library/
 
+# Node.js / frontend (webui/frontend)
+node_modules/
+*.tsbuildinfo
+test-results/
+playwright-report/
+/blob-report/
+/playwright/.cache/
+# The bare `lib/` pattern above (Python build artifacts) would otherwise
+# also match the frontend's own src/lib/ directory.
+!webui/frontend/src/lib/
+
 # Created by https://www.toptal.com/developers/gitignore/api/pycharm
 # Edit at https://www.toptal.com/developers/gitignore?templates=pycharm
 

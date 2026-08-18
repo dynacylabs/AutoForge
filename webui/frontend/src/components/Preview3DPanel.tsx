@@ -1,0 +1,250 @@
+import React, { useEffect, useMemo, useRef } from 'react'
+import { useAppStore } from '../store/appStore'
+import { Box, Loader2, AlertTriangle } from 'lucide-react'
+import { ThreeDView } from './ThreeDView'
+import { ResultsHistory } from './ResultsHistory'
+import { getStackHandles, getStackSegments } from '../lib/colorStack'
+
+export const Preview3DPanel: React.FC = () => {
+  const previewImage = useAppStore((s) => s.previewImage)
+  const stlFile = useAppStore((s) => s.stlFile)
+  const initState = useAppStore((s) => s.initState)
+  const activeFilaments = useAppStore((s) => s.activeFilaments)
+  const inputImage = useAppStore((s) => s.inputImage)
+  const setPreviewImage = useAppStore((s) => s.setPreviewImage)
+  const setInitState = useAppStore((s) => s.setInitState)
+  const currentJob = useAppStore((s) => s.currentJob)
+  const setCurrentJob = useAppStore((s) => s.setCurrentJob)
+  const previewVersion = useAppStore((s) => s.previewVersion)
+  const bumpPreviewVersion = useAppStore((s) => s.bumpPreviewVersion)
+  const wsRef = useRef<WebSocket | null>(null)
+
+  const setSliders = useAppStore((s) => s.setSliders)
+  const applySliders = useAppStore((s) => s.applySliders)
+  const updateSlider = useAppStore((s) => s.updateSlider)
+  const colorSliders = useAppStore((s) => s.colorSliders)
+  const filaments = useAppStore((s) => s.filaments)
+  const colorSlidersRef = useRef(colorSliders)
+
+  // Before any optimization result exists, show what the currently-assigned
+  // slider colors would look like as a simple stacked-layer preview instead
+  // of an empty/placeholder panel — but only once a real filament has been
+  // assigned to at least one slider (the four default columns start enabled
+  // with no filament, which would otherwise render an uninformative gray box).
+  const hasAssignedSliderColor = colorSliders.some((s) => s.enabled && s.layer > 0 && s.filament_uuid)
+  const stackSegments = useMemo(() => {
+    if (!hasAssignedSliderColor) return []
+    const handles = getStackHandles(colorSliders, filaments)
+    return getStackSegments(handles)
+  }, [colorSliders, filaments, hasAssignedSliderColor])
+
+  const optimizationStarted = currentJob && ['running', 'paused', 'pending'].includes(currentJob.status)
+  const jobFailed = currentJob && currentJob.status === 'failed'
+  const jobError = currentJob?.error
+
+  useEffect(() => {
+    colorSlidersRef.current = colorSliders
+  }, [colorSliders])
+
+  // Connect to preview WebSocket for live updates
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${protocol}//${window.location.host}/ws/preview`
+
+    const connect = () => {
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        ws.send('connected')
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'preview_update' && data.image) {
+            // This channel is shared by every connected browser tab, with no
+            // per-connection subscription. Only drop the message when this
+            // tab is actively tracking a *different* job — that's the
+            // harmful case (another job's colors overwrite the one you're
+            // watching). A tab with no job in focus still accepts updates:
+            // jobs started outside this tab's own Run button (via the API,
+            // or picked up from history) have no other way to be noticed.
+            const activeJobId = useAppStore.getState().currentJob?.job_id
+            if (activeJobId && data.job_id !== activeJobId) return
+
+            setPreviewImage(`data:image/png;base64,${data.image}`)
+            // A completed job's colored PLY may have been regenerated
+            // in-place (e.g. from a slider edit) — the URL is otherwise
+            // unchanged, so ThreeDView would never refetch it without this.
+            bumpPreviewVersion()
+
+            // Only apply slider updates when the backend actually sends a
+            // non-empty stack.  Empty payloads must NOT clear the current
+            // sliders (that previously made the color core disappear).
+            if (data.sliders && Array.isArray(data.sliders) && data.sliders.length > 0) {
+              const range = Number.isFinite(data.min_layer) && Number.isFinite(data.max_layer)
+                ? { min: data.min_layer, max: data.max_layer }
+                : undefined
+              applySliders(data.sliders, range)
+            }
+          }
+        } catch {
+          // ignore non-JSON messages
+        }
+      }
+
+      ws.onclose = () => {
+        setTimeout(connect, 2000)
+      }
+
+      ws.onerror = () => {
+        // ignore
+      }
+    }
+
+    connect()
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close()
+        wsRef.current = null
+      }
+    }
+  }, [setPreviewImage, setSliders, bumpPreviewVersion])
+
+  // Always poll init status when we have an image
+  useEffect(() => {
+    if (!inputImage) return
+    if (optimizationStarted) return
+    if (jobFailed) return
+
+    let cancelled = false
+
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/init/status')
+        const data = await res.json()
+        if (cancelled) return
+
+        if (data.status !== 'idle') {
+          setInitState({ status: data.status })
+        }
+
+        if (data.status === 'ready') {
+          const previewRes = await fetch('/api/init/preview')
+          const previewData = await previewRes.json()
+          if (!cancelled && previewData.image) {
+            setPreviewImage(`data:image/png;base64,${previewData.image}`)
+          }
+
+          const slidersRes = await fetch('/api/sliders/from-optimizer')
+          const slidersData = await slidersRes.json()
+          if (
+            !cancelled &&
+            slidersData.sliders &&
+            Array.isArray(slidersData.sliders) &&
+            slidersData.sliders.length > 0
+          ) {
+            const range = Number.isFinite(slidersData.min_layer) && Number.isFinite(slidersData.max_layer)
+              ? { min: slidersData.min_layer, max: slidersData.max_layer }
+              : undefined
+            applySliders(slidersData.sliders, range)
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    poll()
+    const interval = setInterval(poll, 1000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+    }, [inputImage, setPreviewImage, setInitState, updateSlider, optimizationStarted])
+
+  const coloredPlyUrl = stlFile && currentJob?.job_id
+    ? `/api/outputs/colored-ply/${currentJob.job_id}?v=${previewVersion}`
+    : null
+
+  const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage
+
+  const handleSelectHistoryResult = async (jobId: string) => {
+    try {
+      const res = await fetch(`/api/optimize/status/${jobId}`)
+      if (!res.ok) return
+      const job = await res.json()
+      setCurrentJob(job)
+      bumpPreviewVersion()
+    } catch {
+      // ignore
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden">
+      <div className="px-3 py-2 border-b border-gray-700">
+        <h3 className="text-xs font-semibold text-gray-300 flex items-center gap-1">
+          <Box className="w-3.5 h-3.5" />
+          3D Preview
+        </h3>
+      </div>
+      <div className="flex-1 relative">
+        {stlFile ? (
+          <div data-testid="three-d-view" className="w-full h-full">
+            <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
+          </div>
+        ) : optimizationStarted && previewImage ? (
+          <img
+            src={previewImage}
+            alt="Preview"
+            className="w-full h-full object-contain"
+            data-testid="preview-image"
+          />
+        ) : jobFailed ? (
+          <div className="w-full h-full flex flex-col items-center justify-center text-red-400 p-4" data-testid="optimization-error">
+            <AlertTriangle className="w-8 h-8 mb-2 opacity-70" />
+            <p className="text-xs text-center mb-1">Optimization failed</p>
+            {jobError && <p className="text-xs text-center text-red-500/80 max-w-48">{jobError}</p>}
+          </div>
+        ) : stackSegments.length > 0 ? (
+          <div data-testid="color-stack-preview" className="w-full h-full">
+            <ThreeDView stackSegments={stackSegments} className="w-full h-full" />
+          </div>
+        ) : previewImage ? (
+          <img
+            src={previewImage}
+            alt="Preview"
+            className="w-full h-full object-contain"
+            data-testid="preview-image"
+          />
+        ) : initState.status === 'initializing' ? (
+          <div className="w-full h-full flex flex-col items-center justify-center text-gray-400" data-testid="init-loading">
+            <Loader2 className="w-6 h-6 animate-spin mb-2" />
+            <span className="text-xs">Initializing heightmap...</span>
+          </div>
+        ) : showNoFilamentsWarning ? (
+          <div className="w-full h-full flex flex-col items-center justify-center text-yellow-400 p-4" data-testid="no-filaments-warning">
+            <AlertTriangle className="w-8 h-8 mb-2 opacity-70" />
+            <p className="text-xs text-center">Add filaments to the Active Filaments list to generate a 3D preview</p>
+          </div>
+        ) : initState.status === 'ready' ? (
+          <div className="w-full h-full flex items-center justify-center text-gray-500 text-xs" data-testid="init-ready-no-preview">
+            Ready - press Run to start optimization
+          </div>
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center text-gray-500" data-testid="preview-placeholder">
+            <Box className="w-8 h-8 mb-2 opacity-50" />
+            <p className="text-xs">Upload an image to generate 3D preview</p>
+          </div>
+        )}
+        <div style={{ position: 'absolute', bottom: 8, right: 8, zIndex: 10 }} data-testid="results-history-anchor">
+          <ResultsHistory onSelect={handleSelectHistoryResult} />
+        </div>
+      </div>
+    </div>
+  )
+}

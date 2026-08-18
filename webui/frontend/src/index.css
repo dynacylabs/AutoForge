@@ -1,0 +1,64 @@
+:root {
+  --bg-main: #0f1c2a;
+  --bg-panel: #162435;
+  --bg-toolbar: #3f4d63;
+  --bg-toolbar-dark: #2e3a4d;
+  --bg-sidebar: #132233;
+  --bg-input: #0f1925;
+  --border: #5a6778;
+  --border-light: #71839d;
+  --text-primary: #ffffff;
+  --text-secondary: #cfd6e0;
+  --cyan-accent: #00f0ff;
+  --green-accent: #2dfc73;
+  --purple-accent: #7970ff;
+}
+
+@layer base {
+  :root {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 15%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 47% 11%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 188 100% 51%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 217 19% 33%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 19% 20%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 188 100% 51%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 19% 33%;
+    --input: 217 19% 33%;
+    --ring: 188 100% 51%;
+    --radius: 0.5rem;
+  }
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}

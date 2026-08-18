@@ -1,6 +1,8 @@
 import argparse
 import random
 import os
+import threading
+import time
 from typing import Optional
 
 import matplotlib.pyplot as plt
@@ -737,7 +739,24 @@ class FilamentOptimizer:
         fast_pruning: bool = False,
         fast_pruning_percent: float = 0.20,
         pruning_batch_size: int = 0,
-    ):
+        cancel_event: Optional[threading.Event] = None,
+        pause_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Run the pruning pipeline (color -> swap -> layer -> swap-position
+        -> spike removal).
+
+        ``cancel_event``/``pause_event`` are only checked *between* phases,
+        not inside them — the phases themselves (prune_num_colors etc.) are
+        greedy search algorithms with their own internal state and are not
+        safe to interrupt mid-phase without risking an inconsistent result.
+        This still gives a responsive-enough pause/cancel in practice, since
+        each phase is the unit of work a user would want to stop between.
+
+        Returns ``True`` if pruning ran to completion, ``False`` if it was
+        cancelled partway through (the solution as of the last completed
+        phase is kept either way — pruning phases only ever improve or hold
+        the loss, never worsen it, so a partial run is still a valid result).
+        """
         # Now run pruning
         from autoforge.Helper.PruningHelper import (
             prune_num_colors,
@@ -747,6 +766,16 @@ class FilamentOptimizer:
             remove_height_spikes,
             _compute_loss_for_heightmap,
         )
+
+        def _wait_if_paused() -> bool:
+            """Blocks while paused. Returns True if cancelled (while paused
+            or otherwise)."""
+            if pause_event is not None:
+                while pause_event.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return True
+                    time.sleep(0.1)
+            return cancel_event is not None and cancel_event.is_set()
 
         if search_seed:
             self.rng_seed_search(self.best_discrete_loss, 200, autoset_seed=True)
@@ -769,16 +798,27 @@ class FilamentOptimizer:
         torch.cuda.empty_cache()
 
         # Build a combined callback that updates the matplotlib window (CLI)
-        # and also fires the external WebSocket callback (WebUI).
+        # and also fires the external WebSocket callback (WebUI), tagged
+        # with which phase is currently running.
+        self._current_prune_phase = None
+
         def _prune_callback(_optimizer, _percent):
             # Update the matplotlib preview during pruning steps
             self._draw_prune_preview()
             if self.preview_callback is not None:
                 try:
+                    self.preview_callback(_optimizer, _percent, phase=self._current_prune_phase)
+                except TypeError:
+                    # Callers that don't accept the `phase` kwarg (e.g. a
+                    # plain matplotlib-only callback) still work.
                     self.preview_callback(_optimizer, _percent)
                 except Exception:
                     pass
 
+        if _wait_if_paused():
+            return False
+
+        self._current_prune_phase = "Reducing colors"
         prune_num_colors(
             self,
             max_colors_allowed,
@@ -790,6 +830,10 @@ class FilamentOptimizer:
             preview_callback=_prune_callback,
         )
 
+        if _wait_if_paused():
+            return False
+
+        self._current_prune_phase = "Reducing swaps"
         prune_num_swaps(
             self,
             max_swaps_allowed,
@@ -801,6 +845,10 @@ class FilamentOptimizer:
             preview_callback=_prune_callback,
         )
 
+        if _wait_if_paused():
+            return False
+
+        self._current_prune_phase = "Reducing layers"
         prune_redundant_layers(
             self,
             None,
@@ -811,17 +859,28 @@ class FilamentOptimizer:
             preview_callback=_prune_callback,
         )
 
+        if _wait_if_paused():
+            return False
+
+        self._current_prune_phase = "Optimising swap positions"
         optimise_swap_positions(
             self,
             preview_callback=_prune_callback,
         )
+
+        if _wait_if_paused():
+            return False
+
         if getattr(self.args, "spike_removal", False):
+            self._current_prune_phase = "Removing spikes"
             self.post_remove_spikes()
+        self._current_prune_phase = None
         # Calculate and Print current loss
         dg, dh = self.get_discretized_solution(best=True)
         if dh is not None:
             current_loss = _compute_loss_for_heightmap(self, dg)
             print(f"Post-prune discrete loss: {current_loss:.4f}")
+        return True
 
     def post_remove_spikes(self):
         from autoforge.Helper.PruningHelper import (
