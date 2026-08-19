@@ -380,7 +380,7 @@ def _run_optimization_loop(
 
             if (i + 1) % 100 == 0:
                 tbar.set_description(
-                    f"Iteration {i + 1}, Loss = {loss_val:.4f}, "
+                    f"Iteration {i + 1}, Loss = {loss_val.item():.4f}, "
                     f"best validation Loss = {optimizer.best_discrete_loss:.4f}, "
                     f"learning_rate= {optimizer.current_learning_rate:.6f}"
                 )

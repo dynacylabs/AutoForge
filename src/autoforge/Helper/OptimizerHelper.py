@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -144,6 +145,7 @@ def composite_image_cont(
     material_colors: torch.Tensor,  # [M,3]
     material_TDs: torch.Tensor,  # [M]
     background: torch.Tensor,  # [3]
+    compute_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     # 1. per-pixel continuous layer index
     pixel_height = (max_layers * h) * torch.sigmoid(pixel_height_logits)  # [H,W]
@@ -168,6 +170,20 @@ def composite_image_cont(
         (continuous_z.unsqueeze(0) - (layer_idx + 0.5)) * scale
     )  # [L,H,W]
 
+    # `@torch.jit.script` functions do not observe an ambient `torch.autocast`
+    # context (verified empirically: output stayed float32 even inside an
+    # active bf16 autocast region) - every large [L,H,W]/[L,H,W,3] tensor from
+    # here down was silently computed and held in full fp32, roughly doubling
+    # both memory and bandwidth versus the caller's intended precision. Cast
+    # explicitly once here (after the precision-sensitive height/tau logic
+    # above has already produced its fp32 layer mask) so the rest of the
+    # per-layer compositing pipeline - the actual memory-dominant part - runs
+    # in the caller-selected lower precision instead.
+    if compute_dtype is not None:
+        p_print = p_print.to(compute_dtype)
+        layer_colors = layer_colors.to(compute_dtype)
+        layer_TDs = layer_TDs.to(compute_dtype)
+
     # 4. thickness and opacity
     p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
     del p_print
@@ -189,21 +205,28 @@ def composite_image_cont(
 
     trans_fb = 1.0 - opac_fb  # [L,H,W]
     trans_shift = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
-    remain_fb = torch.cumprod(trans_shift, dim=0)  # remaining before each layer [L,H,W]
+    # cumprod over up to max_layers factors accumulates rounding error each
+    # step; accumulate in fp32 regardless of compute_dtype, then drop back
+    # down so the (larger) downstream tensors still get the memory win.
+    remain_fb = torch.cumprod(trans_shift, dim=0, dtype=torch.float32)
     del trans_shift
+    if compute_dtype is not None:
+        remain_fb = remain_fb.to(compute_dtype)
 
     comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
         -1, 1, 1, 3
     )  # [L,H,W,3]
     del opac_fb, colors_fb
 
-    comp = comp_layers.sum(dim=0)  # [H,W,3]
+    # Sum-reduce over layers in fp32 (same reasoning as cumprod above); this
+    # also gives us the function's fp32 return dtype for free.
+    comp = comp_layers.sum(dim=0, dtype=torch.float32)  # [H,W,3]
     del comp_layers
 
     # 6. background
     rem_after = remain_fb[-1] * trans_fb[-1]  # remaining after bottom layer
     del remain_fb, trans_fb
-    comp = comp + rem_after.unsqueeze(-1) * background  # [H,W,3]
+    comp = comp + rem_after.to(torch.float32).unsqueeze(-1) * background  # [H,W,3]
     return comp * 255.0
 
 
@@ -247,6 +270,7 @@ def composite_image_disc(
     material_TDs: torch.Tensor,  # [n_materials]
     background: torch.Tensor,  # [3]
     rng_seed: int = -1,
+    compute_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """
     Discrete counterpart of `composite_image_cont`.
@@ -289,7 +313,7 @@ def composite_image_disc(
         one_hot: torch.Tensor = deterministic_gumbel_softmax(
             global_logits[j], tau_global, hard_flag, seed_j
         )  # [n_materials]
-        idx: int = int(torch.argmax(one_hot).item())
+        idx = torch.argmax(one_hot, dim=-1)
         layer_colors[j] = material_colors[idx]
         layer_TDs[j] = material_TDs[idx].clamp(1e-8, 1e8)
 
@@ -300,6 +324,14 @@ def composite_image_disc(
     p_print: torch.Tensor = (layer_idx < z_int.unsqueeze(0)).to(
         pixel_height.dtype
     )  # [L,H,W]
+
+    # See composite_image_cont: @torch.jit.script does not observe ambient
+    # torch.autocast, so cast explicitly here to get the memory win for the
+    # per-layer compositing pipeline below.
+    if compute_dtype is not None:
+        p_print = p_print.to(compute_dtype)
+        layer_colors = layer_colors.to(compute_dtype)
+        layer_TDs = layer_TDs.to(compute_dtype)
 
     # 4. Thickness, opacity and the rest exactly as in the continuous version.
     p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
@@ -322,21 +354,26 @@ def composite_image_disc(
 
     trans_fb = 1.0 - opac_fb  # [L,H,W]
     trans_prev = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
-    remain_fb = torch.cumprod(trans_prev, dim=0)  # [L,H,W]
+    # Accumulate cumprod/sum in fp32 regardless of compute_dtype (rounding
+    # error compounds over up to max_layers steps), then drop back down so
+    # the larger downstream tensor still gets the memory win.
+    remain_fb = torch.cumprod(trans_prev, dim=0, dtype=torch.float32)  # [L,H,W]
     del trans_prev
+    if compute_dtype is not None:
+        remain_fb = remain_fb.to(compute_dtype)
 
     comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
         -1, 1, 1, 3
     )  # [L,H,W,3]
     del opac_fb, colors_fb
 
-    comp = comp_layers.sum(dim=0)  # [H,W,3]
+    comp = comp_layers.sum(dim=0, dtype=torch.float32)  # [H,W,3]
     del comp_layers
 
     # 6. Background
     rem_after = remain_fb[-1] * trans_fb[-1]
     del remain_fb, trans_fb
-    comp = comp + rem_after.unsqueeze(-1) * background  # [H,W,3]
+    comp = comp + rem_after.to(torch.float32).unsqueeze(-1) * background  # [H,W,3]
 
     return comp * 255.0
 

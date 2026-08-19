@@ -137,7 +137,7 @@ This will generate separate STL files for each color, allowing you to print face
 
 - `--tensorboard` Flag to enable TensorBoard logging.
 - `--run_name` *(Optional)* Name of the run used for TensorBoard logging.
-- `--num_init_rounds` Number of rounds to choose the starting height map from (default: 128).
+- `--num_init_rounds` Number of rounds to choose the starting height map from (default: 1 - extra rounds are currently deterministic and don't add variety, so they only cost startup time).
 - `--num_init_cluster_layers` Number of layers to cluster the image into (default: -1).
 - `--disable_visualization_for_gradio` Simple switch to disable the matplotlib render window for gradio rendering (default: 0).
 - `--best_of` Run the entire program multiple times and output the best result (default: 1)

@@ -48,7 +48,12 @@ def test_optimizer_one_step_cpu():
         perception_loss_module=None,
     )
     loss = optimizer.step(record_best=True)
-    assert isinstance(loss, float)
+    # step() returns a detached tensor (not an eagerly-synced float) so the
+    # hot loop isn't forced to block on the GPU every iteration - callers
+    # materialize it with .item() only where they actually display it.
+    assert torch.is_tensor(loss)
+    assert not loss.requires_grad
+    assert np.isfinite(loss.item())
     dg, dh = optimizer.get_discretized_solution()
     assert dg.shape[0] == optimizer.params["global_logits"].shape[0]
     assert dh.shape == pixel_height_logits_init.shape

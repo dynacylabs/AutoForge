@@ -55,7 +55,12 @@ def _make_optimizer():
 def test_optimizer_step_and_discretize():
     opt = _make_optimizer()
     loss = opt.step(record_best=False)
-    assert isinstance(loss, float)
+    # step() returns a detached tensor (not an eagerly-synced float) so the
+    # hot loop isn't forced to block on the GPU every iteration - callers
+    # materialize it with .item() only where they actually display it.
+    assert torch.is_tensor(loss)
+    assert not loss.requires_grad
+    assert np.isfinite(loss.item())
 
     disc_global, disc_height = opt.get_discretized_solution(best=False)
     assert disc_global.shape[0] == opt.params["global_logits"].shape[0]

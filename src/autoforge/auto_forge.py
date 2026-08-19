@@ -22,6 +22,19 @@ import os
 import traceback
 from typing import Optional, Tuple, List
 
+# Must be set before the CUDA context is created (i.e. before any actual
+# CUDA op - `import torch` alone doesn't trigger this). PyTorch's default
+# caching allocator can end up reserving noticeably more driver memory than
+# what's actually live at the peak, because it services allocation requests
+# from same-sized "segments" and can't split/merge across their boundaries -
+# with the mixed transient tensor sizes this pipeline creates (see
+# composite_image_cont/_disc), that fragmentation is significant. Measured
+# on this repo's benchmark (stl_output_size=150, 500 iters): peak reserved
+# 2.10GB -> 1.46GB, peak nvidia-smi-reported process VRAM 2.28GB -> 1.67GB,
+# with identical loss - pure allocator behavior, zero precision/algorithm
+# impact. setdefault() so a user's own explicit setting always wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import configargparse
 import cv2
 import torch
@@ -282,7 +295,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_init_rounds",
         type=int,
-        default=64,
+        default=1,
+        # Historically defaulted to 64, intended as a "best of N random
+        # restarts" search over the kmeans heightmap init. As currently
+        # implemented, additional rounds are pure overhead with zero effect
+        # on the result: the expensive over-clustering (Stage 1) is shared
+        # across all rounds already, the weighted-KMeans refinement (Stage
+        # 2, in _refine_clusters) is called with a hardcoded
+        # random_state=0 regardless of round, and the cluster ordering
+        # (tsp_order_mst_path) is a fully deterministic algorithm - so
+        # every round produces byte-identical clustering/ordering. The only
+        # thing that varies per round is the pixel *sample* used for the
+        # silhouette quality estimate, and the final round selection
+        # (`min(results, key=lambda x: x[2])`) doesn't even use that
+        # silhouette score, only the (round-invariant) ordering metric.
+        # Verified empirically (2 different --random_seed values,
+        # stl_output_size=150): rounds=1 produces bit-identical loss to the
+        # old rounds=64 default while being significantly faster. If the
+        # random_state=0 in _refine_clusters is ever intentionally
+        # unfixed to restore real per-round diversity, this default should
+        # be revisited.
         help="Number of rounds to choose the starting height map from.",
     )
 
@@ -724,7 +756,7 @@ def _run_optimization_loop(
 
             if (i + 1) % 100 == 0:
                 tbar.set_description(
-                    f"Iteration {i + 1}, Loss = {loss_val:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
+                    f"Iteration {i + 1}, Loss = {loss_val.item():.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
                 )
             if (
                 optimizer.best_step is not None
@@ -1036,6 +1068,8 @@ def start(args) -> float:
 
     # Run optimization loop
     _run_optimization_loop(optimizer, args, device)
+
+    torch.cuda.empty_cache()
 
     # Post-process, prune, and export outputs
     final_loss = _post_optimize_and_export(

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -18,6 +20,7 @@ def loss_fn(
     add_penalty_loss: float = 0.0,
     focus_map: torch.Tensor = None,
     alpha: torch.Tensor = None,
+    compute_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """
     Full forward pass for continuous assignment:
@@ -25,6 +28,10 @@ def loss_fn(
     focus_map acts as a priority mask (values in [0,1]) where 1.0 means full weight and 0 means low weight.
     alpha (optional) is a per-pixel alpha mask [H,W] or [H,W,1] in 0-255 range;
         pixels with alpha < 128 are masked out of the loss.
+    compute_dtype (optional): if set (e.g. torch.bfloat16), the memory-heavy
+        per-layer compositing math runs in this precision instead of fp32 -
+        see composite_image_cont for why this has to be threaded through
+        explicitly rather than relying on ambient torch.autocast.
     """
     comp = composite_image_cont(
         params["pixel_height_logits"],
@@ -36,6 +43,7 @@ def loss_fn(
         material_colors,
         material_TDs,
         background,
+        compute_dtype,
     )
     return compute_loss(
         comp=comp,
@@ -72,7 +80,24 @@ def compute_loss(
     We normalize by the mean weight to keep the magnitude comparable with the unweighted loss.
     """
     comp_lab = srgb_to_lab(comp)
-    target_lab = srgb_to_lab(target)
+
+    # `target` is a fixed image for many consecutive calls (every training
+    # step, all pruning phases operating at one resolution). Cache its Lab
+    # conversion on the tensor object itself so we don't redo the (fairly
+    # expensive, pow/log-heavy) color conversion every single call - it only
+    # needs recomputing when the target tensor is swapped out (e.g. going
+    # from solver resolution to full output resolution during post-processing).
+    target_lab = getattr(target, "_af_lab_cache", None)
+    if (
+        target_lab is None
+        or target_lab.dtype != comp_lab.dtype
+        or target_lab.device != comp_lab.device
+    ):
+        target_lab = srgb_to_lab(target)
+        try:
+            target._af_lab_cache = target_lab
+        except Exception:
+            pass
 
     if focus_map is None and alpha is None:
         mse_loss = F.mse_loss(comp_lab, target_lab)

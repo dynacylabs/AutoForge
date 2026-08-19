@@ -5,11 +5,9 @@ import threading
 import time
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from autoforge.Helper.CAdamW import CAdamW
@@ -21,6 +19,63 @@ from autoforge.Helper.OptimizerHelper import (
 )
 
 from autoforge.Loss.LossFunctions import loss_fn, compute_loss
+
+# `matplotlib.pyplot` (~0.3s) and `torch.utils.tensorboard` (~1.0s) are
+# expensive imports that pull in large dependency trees. Both features are
+# opt-in (visualize defaults on, but is commonly disabled for headless/
+# server use via --no-visualize; tensorboard defaults off), so they're
+# imported lazily below, only when actually needed, instead of unconditionally
+# at module load time. `plt` is populated as a module global the first time
+# `self.visualize_flag` is True (see __init__); every other use site in this
+# file is already gated behind that same flag.
+plt = None
+
+
+def _discretize_height_only(
+    effective_logits: torch.Tensor, h: float, max_layers: int
+) -> torch.Tensor:
+    """
+    The height-only half of ``FilamentOptimizer.discretize_solution`` -
+    factored out so callers that already have ``effective_logits`` and only
+    need the discrete height image (not the per-layer material assignment)
+    can skip both the redundant _apply_height_offset recompute and the
+    O(max_layers) Python-loop Gumbel-softmax material-selection loop that
+    discretize_solution always does to produce its (unused, in that case)
+    discrete_global return value.
+    """
+    pixel_heights = (max_layers * h) * torch.sigmoid(effective_logits)
+    discrete_height_image = torch.round(pixel_heights / h).to(torch.int32)
+    return torch.clamp(discrete_height_image, 0, max_layers)
+
+
+def _compute_height_offset_term(
+    optimizer, target_shape: torch.Size
+) -> torch.Tensor:
+    """
+    The part of ``FilamentOptimizer._apply_height_offset`` that is
+    independent of ``pixel_logits`` - i.e. everything except the final
+    ``pixel_logits + offsets`` add. Depends only on ``height_offsets`` and
+    ``pixel_height_labels`` (both fixed for an optimizer's whole lifetime -
+    pruning never touches either) plus the target spatial shape (also fixed
+    across every candidate within one pruning phase, since removing a layer
+    changes global_logits' layer count but never pixel_height_logits'
+    spatial [H,W] shape). Safe to compute once and reuse via
+    ``cand_params["pixel_height_logits"] + shared_offsets`` instead of a
+    fresh ``_apply_height_offset`` call (gather + possible bicubic
+    interpolate) per candidate.
+    """
+    labels = optimizer.pixel_height_labels.to(torch.long)  # [H,W]
+    offsets_1d = optimizer.best_params["height_offsets"].squeeze(-1)  # [L]
+    gathered = offsets_1d[labels]  # [H,W]
+    mask = (labels != 0).to(gathered.dtype)
+    offsets = gathered * mask
+    if offsets.shape != target_shape:
+        offsets = F.interpolate(
+            offsets.unsqueeze(0).unsqueeze(0),
+            size=target_shape[-2:],
+            mode="bicubic",
+        ).squeeze(0).squeeze(0)
+    return offsets
 
 
 class FilamentOptimizer:
@@ -61,6 +116,16 @@ class FilamentOptimizer:
         self.H, self.W = target.shape[:2]
 
         self.precision = PrecisionManager(device)
+        # `composite_image_cont`/`composite_image_disc` are @torch.jit.script
+        # and don't observe the ambient torch.autocast context (see
+        # composite_image_cont's docstring-adjacent comment) - the memory
+        # win from mixed precision has to be threaded through explicitly as
+        # a dtype argument instead. Reuse whatever dtype PrecisionManager
+        # already selected for this device (None means: stay fp32, e.g. on
+        # MPS/CPU-without-bf16/older GPUs - no behavior change there).
+        self.composite_compute_dtype = (
+            self.precision.autocast_dtype if self.precision.enabled else None
+        )
 
         pixel_height_labels = np.round(pixel_height_labels)
 
@@ -116,8 +181,10 @@ class FilamentOptimizer:
         self.preview_callback = preview_callback
         self.preview_callback_interval = preview_callback_interval
 
-        # Initialize TensorBoard writer
+        # Initialize TensorBoard writer (import is lazy - see module docstring)
         if args.tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+
             if args.run_name:
                 self.writer = SummaryWriter(log_dir=f"runs/{args.run_name}")
             else:
@@ -187,6 +254,9 @@ class FilamentOptimizer:
 
         # If you want a figure for real-time visualization:
         if self.visualize_flag:
+            global plt
+            import matplotlib.pyplot as plt
+
             if self.args.disable_visualization_for_gradio != 1:
                 plt.ion()
             self.fig, self.ax = plt.subplots(2, 3, figsize=(14, 6))
@@ -337,7 +407,9 @@ class FilamentOptimizer:
             record_best (bool, optional): Whether to record the best discrete solution. Defaults to False.
 
         Returns:
-            float: The loss value of the current step.
+            torch.Tensor: A detached 0-dim tensor holding the loss value of the current
+            step. Call `.item()` on it when a Python float is actually needed (e.g. for
+            display) - deferring that sync is the point (see note below).
         """
         if self.pixel_height_logits.grad is not None:
             self.pixel_height_logits.grad = None
@@ -377,6 +449,7 @@ class FilamentOptimizer:
             add_penalty_loss=10.0,
             focus_map=self.focus_map,
             alpha=self.alpha,
+            compute_dtype=self.composite_compute_dtype,
         )
 
         self.precision.backward_and_step(loss, self.optimizer)
@@ -395,10 +468,19 @@ class FilamentOptimizer:
         if record_best:
             self._maybe_update_best_discrete()
         # torch.cuda.empty_cache()
-        loss = loss.item()
-        self.loss = loss
 
-        return loss
+        # `.item()` forces a CUDA sync, blocking the CPU until every kernel
+        # queued so far has actually finished on the GPU. The loss value is
+        # only ever consumed at a coarse interval (progress bar text every
+        # ~100 steps, tensorboard/visualize on their own intervals) - calling
+        # `.item()` unconditionally here meant every single step paid a full
+        # sync, serializing CPU kernel-launch overhead with GPU execution
+        # instead of letting them overlap. Keep a detached tensor here and
+        # let callers materialize it to a float only when they actually
+        # display it.
+        self.loss = loss.detach()
+
+        return self.loss
 
     def discretize_solution(
         self,
@@ -430,9 +512,7 @@ class FilamentOptimizer:
         )
 
         global_logits = params["global_logits"]
-        pixel_heights = (max_layers * h) * torch.sigmoid(effective_logits)
-        discrete_height_image = torch.round(pixel_heights / h).to(torch.int32)
-        discrete_height_image = torch.clamp(discrete_height_image, 0, max_layers)
+        discrete_height_image = _discretize_height_only(effective_logits, h, max_layers)
 
         num_layers = global_logits.shape[0]
         discrete_global_vals = []
@@ -588,8 +668,11 @@ class FilamentOptimizer:
             self.diff_depth_map_ax.set_data(diff_map)
             self.diff_depth_map_ax.set_clim(-2.5, 2.5)
 
+            loss_display = (
+                self.loss.item() if torch.is_tensor(self.loss) else self.loss
+            )
             self.fig.suptitle(
-                f"Step {self.num_steps_done}/{self.args.iterations}, Tau: {tau_g:.4f}, Loss: {self.loss:.4f}, Best Discrete Loss: {self.best_discrete_loss:.4f}"
+                f"Step {self.num_steps_done}/{self.args.iterations}, Tau: {tau_g:.4f}, Loss: {loss_display:.4f}, Best Discrete Loss: {self.best_discrete_loss:.4f}"
             )
             if self.args.disable_visualization_for_gradio != 1:
                 plt.pause(0.01)
@@ -726,6 +809,13 @@ class FilamentOptimizer:
                 self.material_TDs,
                 self.background,
                 rng_seed=self.best_seed,
+                # This runs under no_grad at *full* output resolution (up to
+                # 4x the training loop's processing resolution), making it
+                # the single largest transient allocation in the pipeline -
+                # and it only feeds the preview PNG, not the STL geometry
+                # (that comes from the height map), so the lower-precision
+                # color math is a safe trade here.
+                compute_dtype=self.composite_compute_dtype,
             )
         return best_comp
 
@@ -965,6 +1055,7 @@ class FilamentOptimizer:
                 self.material_TDs,
                 self.background,
                 rng_seed=seed,
+                compute_dtype=self.composite_compute_dtype,
             )
 
             current_disc_loss = compute_loss(
@@ -997,37 +1088,55 @@ class FilamentOptimizer:
         Returns:
             int: Best seed found.
         """
+        # Only the material-selection RNG seed varies across candidates here
+        # - the height map (best_params["pixel_height_logits"]/"height_offsets")
+        # is fixed for the whole search, so the expensive [L,H,W] effective-
+        # thickness pipeline (height offset gather + print mask + bleed) is
+        # computed once and reused, instead of being recomputed from scratch
+        # (inside composite_image_disc) for every one of num_seeds candidates.
+        from autoforge.Helper.PruningHelper import (
+            _make_shared_eff_thick,
+            _material_select_batched_seeds,
+            _compose_candidate,
+        )
+
         best_seed = None
         best_loss = start_loss
-        tbar = tqdm(range(num_seeds), desc="Searching for new best seed")
-        for i in tbar:
-            seed = np.random.randint(0, 1000000)
-            effective_logits = self._apply_height_offset(
-                self.best_params["pixel_height_logits"],
-                self.best_params["height_offsets"],
-            )
-            comp_disc = composite_image_disc(
-                effective_logits,
-                self.best_params["global_logits"],
-                self.vis_tau,
-                self.vis_tau,
-                self.h,
-                self.max_layers,
-                self.material_colors,
-                self.material_TDs,
-                self.background,
-                rng_seed=seed,
-            )
-            current_disc_loss = compute_loss(
-                comp=comp_disc,
-                target=self.target,
-                focus_map=self.focus_map,
-                alpha=self.alpha,
-            ).item()
-            if current_disc_loss < best_loss:
-                best_loss = current_disc_loss
-                best_seed = seed
-                tbar.set_postfix(best_loss=f"{best_loss:.4f}")
+        global_logits = self.best_params["global_logits"]
+        # Batch the per-layer noise-generation + material-selection step
+        # across a group of candidate seeds at once (still composing/scoring
+        # one candidate at a time - only the L-iteration Python loop's
+        # per-iteration cost is amortized across the batch, not the [H,W]
+        # compositing, to avoid growing peak VRAM with num_seeds).
+        seed_batch_size = 20
+        all_seeds = np.random.randint(0, 1000000, size=num_seeds)
+        with torch.no_grad():
+            shared_eff = _make_shared_eff_thick(self)
+            tbar = tqdm(range(0, num_seeds, seed_batch_size), desc="Searching for new best seed")
+            for batch_start in tbar:
+                batch_seeds = all_seeds[batch_start : batch_start + seed_batch_size]
+                seeds_t = torch.as_tensor(batch_seeds, device=global_logits.device, dtype=torch.int64)
+                cols_b, tds_b = _material_select_batched_seeds(
+                    global_logits,
+                    self.material_colors,
+                    self.material_TDs,
+                    seeds_t,
+                    tau=self.vis_tau,
+                )
+                for b, seed in enumerate(batch_seeds):
+                    comp_disc = _compose_candidate(
+                        shared_eff, cols_b[b], tds_b[b], self.background
+                    )
+                    current_disc_loss = compute_loss(
+                        comp=comp_disc,
+                        target=self.target,
+                        focus_map=self.focus_map,
+                        alpha=self.alpha,
+                    ).item()
+                    if current_disc_loss < best_loss:
+                        best_loss = current_disc_loss
+                        best_seed = int(seed)
+                        tbar.set_postfix(best_loss=f"{best_loss:.4f}")
         if autoset_seed and best_loss < start_loss:
             self.best_seed = best_seed
         return best_seed, best_loss

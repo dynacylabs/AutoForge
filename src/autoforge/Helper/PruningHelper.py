@@ -15,10 +15,37 @@ from autoforge.Helper.OptimizerHelper import (
     deterministic_rand_like,
 )
 from autoforge.Loss.LossFunctions import compute_loss
-from autoforge.Modules.Optimizer import FilamentOptimizer
+from autoforge.Modules.Optimizer import FilamentOptimizer, _compute_height_offset_term
 
 # One global lock that serialises every call that needs GPU / VRAM
 _gpu_lock = threading.Lock()
+
+
+def _eff_thick_from_logits(
+    eff_logits: torch.Tensor, max_layers: int, h: float, vis_tau: float
+) -> torch.Tensor:
+    """
+    Compute the [L, H, W] effective-thickness prefix from already-computed
+    effective height logits (post height-offset).  Factored out of
+    ``_make_shared_eff_thick`` so callers whose height map genuinely varies
+    per candidate (e.g. layer-removal pruning) can still skip the rest of
+    composite_image_disc's per-layer material-selection loop.
+    """
+    device = eff_logits.device
+
+    pixel_height = (float(max_layers) * h) * torch.sigmoid(eff_logits)  # [H,W]
+    z_cont = pixel_height / h
+    z_disc = adaptive_round(z_cont, vis_tau, 1.0, 0.0, 0.1)
+    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
+    z_int = torch.round(z_disc).to(torch.int64)  # [H,W]
+
+    layer_idx = torch.arange(max_layers, device=device).view(-1, 1, 1)  # [L,1,1]
+    p_print = (layer_idx < z_int.unsqueeze(0)).to(eff_logits.dtype)      # [L,H,W]
+    p_bleed = bleed_layer_effect(p_print, 0.1)                           # [L,H,W]
+    del p_print
+    eff = torch.clamp(p_bleed, 0.0, 1.0) * h                             # [L,H,W]
+    del p_bleed
+    return eff
 
 
 def _make_shared_eff_thick(optimizer: FilamentOptimizer) -> torch.Tensor:
@@ -31,23 +58,9 @@ def _make_shared_eff_thick(optimizer: FilamentOptimizer) -> torch.Tensor:
         optimizer.best_params["pixel_height_logits"],
         optimizer.best_params["height_offsets"],
     )
-    max_layers = optimizer.max_layers
-    h = optimizer.h
-    device = eff_logits.device
-
-    pixel_height = (float(max_layers) * h) * torch.sigmoid(eff_logits)  # [H,W]
-    z_cont = pixel_height / h
-    z_disc = adaptive_round(z_cont, optimizer.vis_tau, 1.0, 0.0, 0.1)
-    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
-    z_int = torch.round(z_disc).to(torch.int64)  # [H,W]
-
-    layer_idx = torch.arange(max_layers, device=device).view(-1, 1, 1)  # [L,1,1]
-    p_print = (layer_idx < z_int.unsqueeze(0)).to(eff_logits.dtype)      # [L,H,W]
-    p_bleed = bleed_layer_effect(p_print, 0.1)                           # [L,H,W]
-    del p_print
-    eff = torch.clamp(p_bleed, 0.0, 1.0) * h                             # [L,H,W]
-    del p_bleed
-    return eff
+    return _eff_thick_from_logits(
+        eff_logits, optimizer.max_layers, optimizer.h, optimizer.vis_tau
+    )
 
 
 def _opacity_from_ratio(ratio: torch.Tensor) -> torch.Tensor:
@@ -96,9 +109,17 @@ def material_select_from_logits(
     material_colors: torch.Tensor,
     material_TDs: torch.Tensor,
     rng_seed: int = 0,
+    tau: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Material selection for a single candidate [L, M].
+
+    Matches composite_image_disc's per-layer deterministic_gumbel_softmax
+    hard-selection exactly (argmax of softmax((logits+gumbel)/tau) is
+    invariant to tau for tau>0 in the non-degenerate case, but *not* once
+    softmax saturates to NaN at very small tau on large-scale logits - so
+    pass the caller's actual tau_global/vis_tau here rather than relying on
+    the default, to stay bit-identical with the original hot path).
 
     Returns (layer_colors [L,3], layer_TDs [L]).
     """
@@ -109,7 +130,7 @@ def material_select_from_logits(
     for j in range(L):
         noise = deterministic_rand_like(global_logits[j], rng_seed + j)
         g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)
-        y = torch.softmax((global_logits[j] + g) / 0.01, dim=-1)
+        y = torch.softmax((global_logits[j] + g) / tau, dim=-1)
         idx = y.argmax()
         cols[j] = material_colors[idx]
         tds[j] = material_TDs[idx].clamp(1e-8, 1e8)
@@ -122,6 +143,7 @@ def _material_select_batched(
     material_colors: torch.Tensor,
     material_TDs: torch.Tensor,
     rng_seed: int = 0,
+    tau: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched material selection [B, L, M] → ([B, L, 3], [B, L])."""
     B, L, M = global_logits_b.shape
@@ -133,8 +155,47 @@ def _material_select_batched(
         noise = deterministic_rand_like(global_logits_b[0, j], rng_seed + j)
         g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)
         g_b = g.unsqueeze(0).expand(B, -1)                                # [B, M]
-        y = torch.softmax((gl_j + g_b) / 0.01, dim=-1)                    # [B, M]
+        y = torch.softmax((gl_j + g_b) / tau, dim=-1)                     # [B, M]
         idx = y.argmax(dim=-1)                                            # [B]
+        cols[:, j] = material_colors[idx]
+        tds[:, j] = material_TDs[idx].clamp(1e-8, 1e8)
+
+    return cols, tds
+
+
+def _material_select_batched_seeds(
+    global_logits: torch.Tensor,
+    material_colors: torch.Tensor,
+    material_TDs: torch.Tensor,
+    seeds: torch.Tensor,
+    tau: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Material selection for B candidates that all share the *same*
+    global_logits but each use a *different* rng_seed (unlike
+    ``_material_select_batched``, which shares one noise draw across the
+    batch and varies global_logits instead) - the shape rng_seed_search
+    needs: only the material-selection noise varies per candidate.
+
+    ``seeds``: int64 tensor [B] of per-candidate base seeds.
+    Returns (cols [B,L,3], tds [B,L]).
+    """
+    L, M = global_logits.shape
+    B = seeds.shape[0]
+    device = global_logits.device
+    cols = torch.empty(B, L, 3, device=device, dtype=material_colors.dtype)
+    tds = torch.empty(B, L, device=device, dtype=material_TDs.dtype)
+
+    m_idx = torch.arange(M, device=device, dtype=torch.float32)  # [M]
+    for j in range(L):
+        # deterministic_rand_like's formula, vectorized over the batch of
+        # seeds instead of called once per seed: indices[b, m] = m + seeds[b] + j
+        indices = m_idx.unsqueeze(0) + (seeds + j).to(torch.float32).unsqueeze(1)  # [B, M]
+        r = torch.sin(indices) * 43758.5453123
+        noise = r - torch.floor(r)
+        g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)  # [B, M]
+        y = torch.softmax((global_logits[j].unsqueeze(0) + g) / tau, dim=-1)  # [B, M]
+        idx = y.argmax(dim=-1)  # [B]
         cols[:, j] = material_colors[idx]
         tds[:, j] = material_TDs[idx].clamp(1e-8, 1e8)
 
@@ -145,10 +206,13 @@ def _eval_candidates_batch(
     optimizer: FilamentOptimizer,
     dg_candidates: list[torch.Tensor],
     eff_thick: torch.Tensor | None = None,
-) -> list[tuple[float, torch.Tensor]]:
+) -> tuple[float, torch.Tensor]:
     """
-    Evaluate a batch of discrete-assignment candidates, returning
-    ``[(loss, dg), …]`` in the same order as *dg_candidates*.
+    Evaluate a batch of discrete-assignment candidates and return the single
+    best ``(loss, dg)`` pair - every call site immediately does
+    ``min(results, key=lambda x: x[0])`` anyway, so keep per-candidate losses
+    as GPU tensors and defer the CPU sync until after picking the winner
+    (one sync for the whole batch instead of one per candidate).
 
     The expensive [L, H, W] effective thickness is either passed in or
     computed once and reused.  The score functions ``get_image_loss`` /
@@ -157,28 +221,32 @@ def _eval_candidates_batch(
     """
     n_cands = len(dg_candidates)
     if n_cands == 0:
-        return []
+        return float("inf"), None
 
     if eff_thick is None:
         eff_thick = _make_shared_eff_thick(optimizer)
 
     num_materials = optimizer.material_colors.shape[0]
 
-    # Build batched global_logits [B, L, M]
+    # Build batched global_logits [B, L, M] with one scatter_ instead of a
+    # Python loop building B separate [L, M] tensors.
     L = dg_candidates[0].shape[0]
-    gl_batch = torch.stack([
-        disc_to_logits_vectorized(d, num_materials, big_pos=1e5)
-        for d in dg_candidates
-    ], dim=0)  # [B, L, M]
+    dg_batch = torch.stack(dg_candidates, dim=0)  # [B, L]
+    gl_batch = dg_batch.new_full(
+        (n_cands, L, num_materials), fill_value=-1e5, dtype=torch.float32
+    )
+    gl_batch.scatter_(
+        dim=2, index=dg_batch.contiguous().to(torch.long).unsqueeze(-1), value=1e5
+    )
 
     # Material selection — batched (shared prefix)
     cols, tds = _material_select_batched(
         gl_batch, optimizer.material_colors, optimizer.material_TDs,
-        rng_seed=optimizer.best_seed,
+        rng_seed=optimizer.best_seed, tau=optimizer.vis_tau,
     )
 
     # Composite + loss per candidate — iterative, no [B, L, H, W]
-    results = []
+    losses = []
     for b in range(n_cands):
         with _gpu_lock, torch.no_grad():
             comp = _compose_candidate(
@@ -187,10 +255,12 @@ def _eval_candidates_batch(
             loss = compute_loss(
                 comp=comp, target=optimizer.target, focus_map=optimizer.focus_map,
                 alpha=optimizer.alpha,
-            ).item()
-        results.append((loss, dg_candidates[b]))
+            )
+        losses.append(loss)
 
-    return results
+    best_loss_t, best_idx_t = torch.min(torch.stack(losses), dim=0)
+    best_idx = int(best_idx_t.item())
+    return best_loss_t.item(), dg_candidates[best_idx]
 
 
 def disc_to_logits(
@@ -214,11 +284,6 @@ def disc_to_logits(
     )
     return logits
 
-
-def disc_to_logits_vectorized(
-    dg: torch.Tensor, num_materials: int, big_pos: float = 1e5
-) -> torch.Tensor:
-    return disc_to_logits(dg,num_materials,big_pos)
 
 def _chunked(iterable, chunk_size):
     """Yield successive *chunk_size* chunks from *iterable*."""
@@ -289,10 +354,14 @@ def prune_num_colors(
         if len(distinct_mats) <= 1:
             break
 
+        # A single .tolist() (one sync) instead of calling c_from.item()/
+        # c_to.item() (plus an implicit sync from the `!=` bool test) on
+        # every one of the O(N^2) pairs below.
+        distinct_mats_list = distinct_mats.tolist()
         merge_pairs = [
-            (c_from.item(), c_to.item())
-            for c_from in distinct_mats
-            for c_to in distinct_mats
+            (c_from, c_to)
+            for c_from in distinct_mats_list
+            for c_to in distinct_mats_list
             if c_from != c_to
         ]
 
@@ -314,11 +383,15 @@ def prune_num_colors(
             break
 
         if fast:
+            # Precompute the full pairwise squared-distance matrix once (a
+            # single small GPU op + one .tolist() sync) instead of a
+            # separate torch.sum(...).float() GPU call+sync per pair below -
+            # num_materials is small so the full [M,M] matrix is cheap.
             mat_colors = optimizer.material_colors
-            pair_distances = [
-                float(torch.sum((mat_colors[a] - mat_colors[b]) ** 2))
-                for (a, b) in merge_pairs
-            ]
+            dist_matrix = (
+                (mat_colors.unsqueeze(0) - mat_colors.unsqueeze(1)) ** 2
+            ).sum(-1).tolist()
+            pair_distances = [dist_matrix[a][b] for (a, b) in merge_pairs]
             sorted_idx = sorted(
                 range(len(merge_pairs)), key=lambda i: pair_distances[i]
             )
@@ -333,15 +406,14 @@ def prune_num_colors(
             for chunk in _chunked(merge_pairs, chunk_size):
                 if pruning_batch_size > 0:
                     dg_list = [merge_color(best_dg, *pair) for pair in chunk]
-                    cand_results = _eval_candidates_batch(
+                    merge_loss, merge_dg = _eval_candidates_batch(
                         optimizer, dg_list, eff_thick=shared_eff,
                     )
                 else:
                     cand_results = Parallel(
                         n_jobs=n_jobs, backend="threading", prefer="threads"
                     )(delayed(score_color)(best_dg, *pair) for pair in chunk)
-
-                merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
+                    merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
 
                 if merge_loss < best_loss * (1 + allowed_loss_increase_percent):
                     best_dg = merge_dg
@@ -366,15 +438,14 @@ def prune_num_colors(
         else:
             if pruning_batch_size > 0:
                 dg_list = [merge_color(best_dg, *pair) for pair in merge_pairs]
-                cand_results = _eval_candidates_batch(
+                merge_loss, merge_dg = _eval_candidates_batch(
                     optimizer, dg_list, eff_thick=shared_eff,
                 )
             else:
                 cand_results = Parallel(
                     n_jobs=n_jobs, backend="threading", prefer="threads"
                 )(delayed(score_color)(best_dg, *pair) for pair in merge_pairs)
-
-            merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
+                merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
 
             if merge_loss < best_loss or len(distinct_mats) > max_colors_allowed:
                 best_dg = merge_dg
@@ -485,14 +556,14 @@ def prune_num_swaps(
             break
 
         if fast:
+            # Same pairwise-distance-matrix precompute as prune_num_colors -
+            # avoids a GPU sync per merge_spec below.
             mat_colors = optimizer.material_colors
+            dist_matrix = (
+                (mat_colors.unsqueeze(0) - mat_colors.unsqueeze(1)) ** 2
+            ).sum(-1).tolist()
             band_distances = [
-                float(
-                    torch.sum(
-                        (mat_colors[spec[0][2]] - mat_colors[spec[1][2]]) ** 2
-                    )
-                )
-                for spec in merge_specs
+                dist_matrix[spec[0][2]][spec[1][2]] for spec in merge_specs
             ]
             sorted_idx = sorted(
                 range(len(merge_specs)), key=lambda i: band_distances[i]
@@ -508,7 +579,7 @@ def prune_num_swaps(
             for chunk in _chunked(merge_specs, chunk_size):
                 if pruning_batch_size > 0:
                     dg_list = [merge_bands(best_dg, *spec) for spec in chunk]
-                    cand_results = _eval_candidates_batch(
+                    merge_loss, merge_dg = _eval_candidates_batch(
                         optimizer, dg_list, eff_thick=shared_eff,
                     )
                 else:
@@ -518,8 +589,7 @@ def prune_num_swaps(
                         delayed(score_swap)(best_dg, band_a, band_b, direction)
                         for band_a, band_b, direction in chunk
                     )
-
-                merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
+                    merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
 
                 # Accept merge if loss increase is allowed
                 if merge_loss < best_loss * (1 + allowed_loss_increase_percent):
@@ -547,7 +617,7 @@ def prune_num_swaps(
         else:
             if pruning_batch_size > 0:
                 dg_list = [merge_bands(best_dg, *spec) for spec in merge_specs]
-                cand_results = _eval_candidates_batch(
+                merge_loss, merge_dg = _eval_candidates_batch(
                     optimizer, dg_list, eff_thick=shared_eff,
                 )
             else:
@@ -557,8 +627,7 @@ def prune_num_swaps(
                     delayed(score_swap)(best_dg, band_a, band_b, direction)
                     for band_a, band_b, direction in merge_specs
                 )
-
-            merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
+                merge_loss, merge_dg = min(cand_results, key=lambda x: x[0])
 
             if merge_loss < best_loss or num_swaps > max_swaps_allowed:
                 best_dg, best_loss = merge_dg, merge_loss
@@ -638,10 +707,11 @@ def remove_layer_from_solution(
     optimizer,
     params,
     layer_to_remove,
-    final_tau,
     h,
     current_max_layers,
-    rng_seed,
+    effective_logits: torch.Tensor | None = None,
+    disc_height: torch.Tensor | None = None,
+    current_height: torch.Tensor | None = None,
 ):
     """
     Remove one layer from the solution.
@@ -649,26 +719,36 @@ def remove_layer_from_solution(
     Args:
         params (dict): Current parameters with keys "global_logits" and "pixel_height_logits".
         layer_to_remove (int): Candidate layer index to remove.
-        final_tau (float): Final tau value used in discretization/compositing.
         h (float): Layer height.
         current_max_layers (int): Current total number of layers.
-        rng_seed (int): Seed used in discretization/compositing.
+        effective_logits, disc_height, current_height: optional precomputed
+            values, all derived solely from ``params``/``h``/``current_max_layers``
+            - callers evaluating many candidate removals against the *same*
+            params (e.g. prune_redundant_layers' score_layer, once per chunk)
+            all need identical values here, so compute them once outside the
+            loop and pass them in instead of recomputing (including a
+            redundant duplicate sigmoid call - disc_height and current_height
+            both derive from the same "(current_max_layers*h)*sigmoid(...)"
+            quantity) per candidate.
 
     Returns:
         new_params (dict): New parameters with the candidate layer removed.
         new_max_layers (int): Updated number of layers.
     """
-    # Get the current discrete height image (used to decide which pixels need adjusting)
-    effective_logits = optimizer._apply_height_offset(
-        params["pixel_height_logits"], params["height_offsets"]
-    )
-    _, disc_height = optimizer.discretize_solution(
-        params,
-        final_tau,
-        h,
-        current_max_layers,
-        rng_seed,
-    )
+    if effective_logits is None:
+        effective_logits = optimizer._apply_height_offset(
+            params["pixel_height_logits"], params["height_offsets"]
+        )
+    # disc_height (used below to decide which pixels need adjusting) and
+    # current_height are both derived from effective_logits alone - see
+    # _discretize_height_only's docstring for why this skips
+    # optimizer.discretize_solution's unused material-selection work.
+    if current_height is None:
+        current_height = current_max_layers * h * torch.sigmoid(effective_logits)
+    if disc_height is None:
+        disc_height = torch.clamp(
+            torch.round(current_height / h).to(torch.int32), 0, current_max_layers
+        )
 
     # Remove the candidate layer from the global (color) assignment.
     new_global_logits = torch.cat(
@@ -680,8 +760,6 @@ def remove_layer_from_solution(
     )
     new_max_layers = new_global_logits.shape[0]
 
-    # Compute current effective height: height = (current_max_layers * h) * sigmoid(pixel_height_logits)
-    current_height = current_max_layers * h * torch.sigmoid(effective_logits)
     new_height = current_height.clone()
     mask = disc_height >= layer_to_remove
     new_height[mask] = new_height[mask] - h
@@ -724,6 +802,19 @@ def prune_redundant_layers(
     current_max_layers = optimizer.best_params["global_logits"].shape[0]
     optimizer.max_layers = current_max_layers  # keep optimiser in sync
 
+    # height_offsets/pixel_height_labels never change anywhere in the
+    # pruning pipeline (only global_logits/pixel_height_logits do), and
+    # pixel_height_logits' spatial [H,W] shape is likewise fixed across
+    # every layer-removal candidate (only the layer axis/global_logits
+    # count shrinks) - so the additive height-offset term that
+    # _apply_height_offset would otherwise recompute (gather + a possible
+    # bicubic interpolate up to full output resolution) on every one of the
+    # hundreds of candidate evaluations below is invariant for this whole
+    # call. Compute it once and add it directly instead.
+    shared_height_offset = _compute_height_offset_term(
+        optimizer, optimizer.best_params["pixel_height_logits"].shape
+    )
+
     # Baseline loss with current best parameters
     best_loss = get_initial_loss(current_max_layers, optimizer)
 
@@ -747,15 +838,24 @@ def prune_redundant_layers(
             optimizer,
             optimizer.best_params,
             idx,
-            optimizer.vis_tau,
             optimizer.h,
             current_max_layers,
-            optimizer.best_seed,
+            effective_logits=current_eff_logits,
+            disc_height=current_disc_height,
+            current_height=current_pixel_height,
         )
-        eff_logits = optimizer._apply_height_offset(
-            cand_params["pixel_height_logits"], cand_params["height_offsets"]
-        )
+        eff_logits = cand_params["pixel_height_logits"] + shared_height_offset
         with _gpu_lock, torch.no_grad():
+            # The height map genuinely differs per removed-layer candidate,
+            # so the [L,H,W] effective-thickness prefix can't be shared here
+            # (unlike prune_num_colors/prune_num_swaps/rng_seed_search).
+            # Measured: routing through the eager material_select_from_logits
+            # + _compose_candidate path (no shared-prefix reuse to amortize)
+            # is a net *regression* here - it trades composite_image_disc's
+            # compiled TorchScript loop for two eager Python loops, and that
+            # per-op dispatch overhead outweighs the one .item() sync/layer
+            # it would have saved. Keep the jit-scripted call (already
+            # sync-free as of the composite_image_disc fix above).
             cand_comp = composite_image_disc(
                 eff_logits,
                 cand_params["global_logits"],
@@ -781,6 +881,23 @@ def prune_redundant_layers(
         improvement = False
         layer_indices = list(range(current_max_layers))
 
+        # optimizer.best_params only changes when a candidate is accepted
+        # below (which restarts this while loop) - so every score_layer
+        # candidate tried in this iteration shares the same starting
+        # effective_logits/disc_height/current_height. Compute them once
+        # here instead of once per candidate inside remove_layer_from_solution.
+        current_eff_logits = (
+            optimizer.best_params["pixel_height_logits"] + shared_height_offset
+        )
+        current_pixel_height = (
+            current_max_layers * optimizer.h * torch.sigmoid(current_eff_logits)
+        )
+        current_disc_height = torch.clamp(
+            torch.round(current_pixel_height / optimizer.h).to(torch.int32),
+            0,
+            current_max_layers,
+        )
+
         if preview_callback is not None:
             try:
                 preview_callback(
@@ -793,13 +910,16 @@ def prune_redundant_layers(
         if fast:
             # Sort layers by pixel coverage (fewest pixels first), so the
             # least impactful removals are tried first and the early-break
-            # logic finds a good candidate sooner.
-            _, disc_height = optimizer.get_discretized_solution(best=True)
+            # logic finds a good candidate sooner. Reuse current_disc_height
+            # (computed above) instead of optimizer.get_discretized_solution,
+            # which would redundantly recompute the same height map *and*
+            # run its unused O(max_layers) material-selection loop.
             layer_counts = torch.bincount(
-                disc_height.ravel().to(torch.int64), minlength=current_max_layers
+                current_disc_height.ravel().to(torch.int64), minlength=current_max_layers
             )
+            layer_counts_list = layer_counts.tolist()
             layer_indices = sorted(
-                layer_indices, key=lambda i: layer_counts[i].item()
+                layer_indices, key=lambda i: layer_counts_list[i]
             )
 
             chunk_size = max(1, math.ceil(len(layer_indices) * chunking_percent))
@@ -807,9 +927,19 @@ def prune_redundant_layers(
             best_cand_loss = float("inf")
 
             for chunk in _chunked(layer_indices, chunk_size):
-                cand_results = Parallel(
-                    n_jobs=n_jobs, backend="threading", prefer="threads"
-                )(delayed(score_layer)(idx) for idx in chunk)
+                # Sequential rather than joblib.Parallel(threading): _gpu_lock
+                # already serializes the actual composite_image_disc work, and
+                # real thread-level concurrency here (overlapping one
+                # candidate's unlocked remove_layer_from_solution prep with
+                # another's locked compositing) causes genuine CUDA-kernel-
+                # interleaving nondeterminism - a real, if small, effect on
+                # the converged loss (see results.tsv). Going sequential is
+                # both faster (no thread-pool dispatch overhead, no unlocked
+                # tensors from multiple in-flight candidates held at once)
+                # and removes that nondeterminism. Accepted per-project
+                # decision: the loss difference this trades away is small
+                # enough to be worth the speed/VRAM win.
+                cand_results = [score_layer(idx) for idx in chunk]
 
                 cand_loss, cand_params, cand_max_layers = min(
                     cand_results, key=lambda x: x[0]
@@ -908,6 +1038,12 @@ def get_initial_loss(current_max_layers, optimizer):
             optimizer.material_TDs,
             optimizer.background,
             rng_seed=optimizer.best_seed,
+            # By the time this runs (post-optimization), optimizer.target and
+            # best_params["pixel_height_logits"] have already been swapped to
+            # full output resolution (up to 4x the training loop's processing
+            # resolution) - making this the single largest transient
+            # allocation in the whole pipeline if left at fp32.
+            compute_dtype=getattr(optimizer, "composite_compute_dtype", None),
         )
         best_loss = compute_loss(ref_comp, optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
     return best_loss
@@ -1139,11 +1275,53 @@ def optimise_swap_positions(
 
     num_materials = optimizer.material_colors.shape[0]
 
+    # Tried sharing the [L,H,W] effective-thickness prefix here too (height
+    # never changes in this function, only which material occupies which
+    # layer) via material_select_from_logits + _compose_candidate, mirroring
+    # rng_seed_search. Measured net *slower* on the benchmark input: this
+    # phase typically evaluates few candidates per boundary (narrow ranges
+    # after layer pruning has already collapsed the layer count), so the
+    # two eager per-layer Python loops cost more than the single shared
+    # prefix computation saves. See results.tsv discard entry. Keep the
+    # jit-scripted composite_image_disc path.
+    #
+    # get_best_discretized_image itself would recompute _apply_height_offset
+    # (gather + a bicubic interpolate up to full output resolution, see the
+    # prune_redundant_layers height-offset-term fix) on every candidate even
+    # though height never changes here - call composite_image_disc directly
+    # with a once-computed effective_logits instead.
+    eff_logits = (
+        optimizer.best_params["pixel_height_logits"]
+        + _compute_height_offset_term(
+            optimizer, optimizer.best_params["pixel_height_logits"].shape
+        )
+    )
+    # Shared effective-thickness prefix for the batched boundary-position
+    # search below (height is invariant here) - unlike the discarded
+    # per-candidate eager-loop attempt above, _eval_candidates_batch does
+    # *true* batched material selection (_material_select_batched, one
+    # tensor op across the whole candidate group per layer) rather than a
+    # Python loop per candidate, so it doesn't pay the same per-candidate
+    # dispatch overhead that made that attempt a net regression.
+    shared_eff_thick = _eff_thick_from_logits(
+        eff_logits, optimizer.max_layers, optimizer.h, optimizer.vis_tau
+    )
+
     def disc_loss(dg_test: torch.Tensor) -> float:
         logits_for_disc = disc_to_logits(dg_test, num_materials, big_pos=1e5)
         with _gpu_lock, torch.no_grad():
-            out = optimizer.get_best_discretized_image(
-                custom_global_logits=logits_for_disc
+            out = composite_image_disc(
+                eff_logits,
+                logits_for_disc,
+                optimizer.vis_tau,
+                optimizer.vis_tau,
+                optimizer.h,
+                optimizer.max_layers,
+                optimizer.material_colors,
+                optimizer.material_TDs,
+                optimizer.background,
+                rng_seed=optimizer.best_seed,
+                compute_dtype=optimizer.composite_compute_dtype,
             )
             return compute_loss(comp=out, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
 
@@ -1184,19 +1362,26 @@ def optimise_swap_positions(
             if lower_limit >= upper_limit:
                 continue
 
-            def candidate_loss(new_boundary: int):
-                if new_boundary == band_a[1]:
-                    return float("inf"), None, None
+            new_positions = [
+                b for b in range(lower_limit, upper_limit + 1) if b != band_a[1]
+            ]
+            if not new_positions:
+                continue
+
+            dg_list = []
+            for new_boundary in new_positions:
                 dg_new = best_dg.clone()
                 dg_new[lower_limit : new_boundary + 1] = band_a[2]
                 dg_new[new_boundary + 1 : upper_limit + 1] = band_b[2]
-                return disc_loss(dg_new), dg_new, new_boundary
+                dg_list.append(dg_new)
 
-            results = Parallel(n_jobs=n_jobs, backend="threading", prefer="threads")(
-                delayed(candidate_loss)(b) for b in range(lower_limit, upper_limit + 1)
+            # Batched material selection (one tensor op per layer across the
+            # whole candidate group, via _eval_candidates_batch) instead of
+            # evaluating each boundary position one at a time.
+            cand_loss, cand_dg = _eval_candidates_batch(
+                optimizer, dg_list, eff_thick=shared_eff_thick
             )
-
-            cand_loss, cand_dg, new_pos = min(results, key=lambda x: x[0])
+            new_pos = new_positions[next(i for i, d in enumerate(dg_list) if d is cand_dg)]
 
             if cand_loss < best_loss * (1 + allowed_loss_increase_percent):
                 old_pos = band_a[1]
