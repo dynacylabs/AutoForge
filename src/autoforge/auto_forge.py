@@ -545,8 +545,19 @@ def _compute_pixel_sizes(args) -> Tuple[int, int]:
         (computed_output_size, computed_processing_size)
     """
     computed_output_size = int(round(args.stl_output_size * 2 / args.nozzle_diameter))
-    computed_processing_size = int(
-        round(computed_output_size / args.processing_reduction_factor)
+    reduced_size = int(round(computed_output_size / args.processing_reduction_factor))
+    # Below MIN_PROCESSING_SIZE, applying the reduction factor barely moves
+    # the needle on training cost (the image is already tiny) but throws away
+    # a large fraction of the already-small pixel budget, which measurably
+    # hurts final loss - verified empirically (stl_output_size=20,
+    # nozzle=0.4, reduction_factor=2: processing_size 50->100 improved mean
+    # loss ~30% across 4 seeds for ~0% time/VRAM cost). Clamping only kicks
+    # in for small outputs; anything already at/above this resolution
+    # (e.g. the default stl_output_size=150 case, processing_size=375) is
+    # completely unaffected.
+    MIN_PROCESSING_SIZE = 100
+    computed_processing_size = min(
+        computed_output_size, max(MIN_PROCESSING_SIZE, reduced_size)
     )
     print(f"Computed solving pixel size: {computed_output_size}")
     return computed_output_size, computed_processing_size
@@ -818,6 +829,15 @@ def _post_optimize_and_export(
     with torch.no_grad():
         with safe_autocast(device):
             if args.perform_pruning:
+                # Same post-hoc height-offset fine-tune as the no-pruning
+                # path below, run before any pruning phase touches
+                # best_params - pruning's own greedy color/swap/layer search
+                # starts from whatever height is already there, so giving it
+                # the best achievable height first (rather than only
+                # fine-tuning once at the very end) lets every later phase
+                # benefit, not just the final output.
+                optimizer.fine_tune_height_offsets(num_steps=200)
+
                 # Adjust pruning_max_colors to account for background and clear filament
                 # pruning_max_colors = total filaments needed
                 # Need to reserve slots: 1 for background (always), 1 for clear (FlatForge only)
@@ -847,6 +867,21 @@ def _post_optimize_and_export(
                     namespace="post_opt",
                     step=(post_opt_step := post_opt_step + 1),
                 )
+            else:
+                # Pruning's rng_seed_search (a cheap post-hoc search over the
+                # material-selection RNG seed, given the already-converged
+                # best_params) normally only runs as pruning's first phase -
+                # skipping pruning entirely also skipped this refinement, even
+                # though it's independent of pruning and equally applicable
+                # here. Run it unconditionally so the non-pruning path gets
+                # the same free quality improvement.
+                optimizer.rng_seed_search(
+                    optimizer.best_discrete_loss, 50, autoset_seed=True
+                )
+                from autoforge.Helper.PruningHelper import optimise_swap_positions
+
+                optimise_swap_positions(optimizer, max_passes=3)
+                optimizer.fine_tune_height_offsets(num_steps=200)
 
             disc_global, disc_height_image = optimizer.get_discretized_solution(
                 best=True
@@ -1068,6 +1103,30 @@ def start(args) -> float:
 
     # Run optimization loop
     _run_optimization_loop(optimizer, args, device)
+
+    # record_best only fires every args.discrete_check steps (default 100),
+    # so with e.g. 1000 iterations the last checkpoint is at step 900 - the
+    # fully-trained final state (steps 900-999) is never evaluated as a best-
+    # solution candidate unless iterations happens to be a multiple of
+    # discrete_check. Repeated checks here, using the exact same (already
+    # training-proven) discretize+evaluate path with a fresh random seed each
+    # time, can only improve or hold best_discrete_loss - and a single check
+    # risks an unlucky seed making the (possibly genuinely superior) final
+    # continuous state look worse than an earlier checkpoint by chance, so it
+    # never gets picked as the base for rng_seed_search's later, more
+    # thorough search. This training loop has already finished, so the extra
+    # calls (cheap: one composite each) don't touch training dynamics/timing.
+    #
+    # (Tried swapping this for rng_seed_search's faster shared-eff-thick
+    # batched machinery instead of the plain per-attempt composite loop
+    # below, hoping to afford far more attempts for the same time budget -
+    # see results.tsv discard entry. It wasn't reliably cheaper per-attempt
+    # at this benchmark's small image size, needed ~300 attempts to beat
+    # this loop's 60, and pushed total time past what the extra loss
+    # reduction was worth. Kept the simpler, cheaper, already-validated loop.)
+    with torch.no_grad():
+        for _ in range(60):
+            optimizer._maybe_update_best_discrete()
 
     torch.cuda.empty_cache()
 

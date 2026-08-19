@@ -1262,6 +1262,7 @@ def optimise_swap_positions(
     *,
     allowed_loss_increase_percent: float = 0.0,
     preview_callback=None,
+    max_passes: int | None = None,
 ) -> torch.Tensor:
     """
     Exhaustively move each swap boundary to every admissible layer and keep the
@@ -1335,6 +1336,8 @@ def optimise_swap_positions(
     while improved:
         improved = False
         pass_idx += 1
+        if max_passes is not None and pass_idx > max_passes:
+            break
         outer_tbar.update(1)
 
         if preview_callback is not None:

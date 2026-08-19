@@ -463,6 +463,13 @@ def export_results(
         with safe_autocast(device):
             # ---- Pruning ----
             if args.perform_pruning:
+                # Same post-hoc height-offset fine-tune the CLI path
+                # (auto_forge._post_optimize_and_export) runs before pruning
+                # starts - pruning's own greedy search benefits from the
+                # best achievable height from its very first phase, not just
+                # at the end. See FilamentOptimizer.fine_tune_height_offsets.
+                optimizer.fine_tune_height_offsets(num_steps=50)
+
                 max_colors_for_pruning = args.pruning_max_colors
                 if args.flatforge:
                     max_colors_for_pruning = max(1, args.pruning_max_colors - 2)

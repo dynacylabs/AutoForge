@@ -734,7 +734,7 @@ class FilamentOptimizer:
         }
 
     def get_discretized_solution(
-        self, best: bool = False, custom_height_logits: torch.Tensor = None
+        self, best: bool = False, custom_height_logits: torch.Tensor = None, apply_height_offset: bool = True
     ):
         """
         Return the discrete global assignment and the discrete pixel-height map
@@ -754,7 +754,7 @@ class FilamentOptimizer:
         if custom_height_logits is not None:
             current_params["pixel_height_logits"] = self._apply_height_offset(
                 custom_height_logits
-            )
+            ) if apply_height_offset else custom_height_logits
 
         if best:
             disc_global, disc_height_image = self.discretize_solution(
@@ -961,6 +961,13 @@ class FilamentOptimizer:
         if _wait_if_paused():
             return False
 
+        self._current_prune_phase = "Fine-tuning height"
+        self.fine_tune_height_offsets(num_steps=50)
+        _prune_callback(self, 95)
+
+        if _wait_if_paused():
+            return False
+
         if getattr(self.args, "spike_removal", False):
             self._current_prune_phase = "Removing spikes"
             self.post_remove_spikes()
@@ -1018,6 +1025,104 @@ class FilamentOptimizer:
                     )
             except Exception:
                 pass
+
+    def fine_tune_height_offsets(
+        self, num_steps: int = 50, lr: float = 0.007
+    ) -> bool:
+        """
+        Post-hoc refinement of ``height_offsets`` with the material
+        assignment frozen at its current (hard, one-hot-like) discrete
+        choice - a differentiable "polish" pass distinct from
+        ``rng_seed_search``/``optimise_swap_positions`` (which only search
+        over discrete choices, never adjust the continuous height directly).
+
+        Critically, this optimizes at tau=1.0 (matching the main training
+        loop's schedule, not ``self.vis_tau``) - tau=1.0 keeps the print-mask
+        sigmoid's scale factor (``10.0/(tau_height+eps)``) small and the
+        gradient well-behaved; at ``vis_tau`` (0.01) that scale factor
+        explodes to ~1000, making every tested learning rate wildly
+        unstable (verified empirically: even lr=0.001 at vis_tau made the
+        result 3-8x worse). The soft tau=1.0 loss only drives the gradient
+        step - the real discrete loss is re-checked every step, the best
+        (loss, offsets) pair seen is tracked throughout, and the run stops
+        early once ``patience`` steps pass without a new best. Only that
+        best snapshot is ever kept, so a bad late-step trajectory can never
+        regress the result below the starting point.
+
+        Returns:
+            bool: True if the fine-tuned offsets were kept (improved the
+            real discrete loss), False if reverted.
+        """
+        from autoforge.Helper.PruningHelper import (
+            _compute_loss_for_heightmap,
+            disc_to_logits,
+        )
+        from autoforge.Loss.LossFunctions import loss_fn
+
+        dg_cur, _ = self.get_discretized_solution(best=True)
+        pre_loss = _compute_loss_for_heightmap(self, dg_cur)
+        fixed_global_logits = disc_to_logits(
+            dg_cur, self.material_colors.shape[0], big_pos=1e5
+        ).detach()
+        pixel_logits = self.best_params["pixel_height_logits"].detach()
+        orig_offsets = self.best_params["height_offsets"].detach().clone()
+        best_loss = pre_loss
+        best_offsets = orig_offsets.clone()
+        steps_since_best = 0
+        patience = max(10, num_steps // 4)
+
+        with torch.enable_grad():
+            ft_offsets = orig_offsets.clone().requires_grad_(True)
+            ft_optimizer = CAdamW([ft_offsets], lr=lr)
+            tbar = tqdm(range(num_steps), desc="Fine-tuning height", leave=True)
+            for _ in tbar:
+                ft_optimizer.zero_grad()
+
+                effective_logits = self._apply_height_offset(pixel_logits, ft_offsets)
+
+                self.best_params["height_offsets"] = ft_offsets.detach()
+                dg_step, _ = self.get_discretized_solution(best=True)
+                s_loss = _compute_loss_for_heightmap(self, dg_step)
+
+                if s_loss < best_loss:
+                    best_loss = s_loss
+                    best_offsets = ft_offsets.detach().clone()
+                    steps_since_best = 0
+                else:
+                    steps_since_best += 1
+                tbar.set_description(
+                    f"Pre_Loss: {pre_loss:.4f} Best: {best_loss:.4f}"
+                )
+                if steps_since_best > patience:
+                    break
+
+                loss = loss_fn(
+                    {
+                        "pixel_height_logits": effective_logits,
+                        "global_logits": fixed_global_logits,
+                    },
+                    target=self.target,
+                    tau_height=1.0,
+                    tau_global=1.0,
+                    h=self.h,
+                    max_layers=self.max_layers,
+                    material_colors=self.material_colors,
+                    material_TDs=self.material_TDs,
+                    background=self.background,
+                    add_penalty_loss=10.0,
+                    focus_map=self.focus_map,
+                    alpha=self.alpha,
+                    compute_dtype=self.composite_compute_dtype,
+                )
+                loss.backward()
+                ft_optimizer.step()
+
+        if best_loss < pre_loss:
+            self.best_params["height_offsets"] = best_offsets
+            self.best_discrete_loss = best_loss
+            return True
+        self.best_params["height_offsets"] = orig_offsets
+        return False
 
     def _maybe_update_best_discrete(self):
         """
@@ -1137,7 +1242,56 @@ class FilamentOptimizer:
                         best_loss = current_disc_loss
                         best_seed = int(seed)
                         tbar.set_postfix(best_loss=f"{best_loss:.4f}")
-        if autoset_seed and best_loss < start_loss:
+
+        if best_seed is not None:
+            # `_material_select_batched_seeds`/`_compose_candidate` (the
+            # batched fast-path used above) can disagree with the exact
+            # per-layer `deterministic_gumbel_softmax` + `composite_image_disc`
+            # path that actually produces the final output (e.g. differing
+            # NaN-handling for extreme gumbel-softmax inputs at very low tau -
+            # same root cause as the b158c32 discard in results.tsv). Verify
+            # the winning candidate against the exact path before trusting it
+            # - cheap (one extra composite) relative to the num_seeds batched
+            # search, and prevents ever regressing below start_loss.
+            with torch.no_grad():
+                disc_global, _ = self.discretize_solution(
+                    self.best_params, self.vis_tau, self.h, self.max_layers,
+                    rng_seed=best_seed,
+                )
+                from autoforge.Helper.PruningHelper import disc_to_logits
+                disc_global_logits = disc_to_logits(
+                    disc_global, self.material_colors.shape[0], big_pos=1e5
+                )
+                effective_logits = self._apply_height_offset(
+                    self.best_params["pixel_height_logits"],
+                    self.best_params["height_offsets"],
+                )
+                verified_comp = composite_image_disc(
+                    effective_logits,
+                    disc_global_logits,
+                    self.vis_tau,
+                    self.vis_tau,
+                    self.h,
+                    self.max_layers,
+                    self.material_colors,
+                    self.material_TDs,
+                    self.background,
+                    rng_seed=best_seed,
+                    compute_dtype=self.composite_compute_dtype,
+                )
+                verified_loss = compute_loss(
+                    comp=verified_comp,
+                    target=self.target,
+                    focus_map=self.focus_map,
+                    alpha=self.alpha,
+                ).item()
+            if verified_loss < start_loss:
+                best_loss = verified_loss
+            else:
+                best_seed = None
+                best_loss = start_loss
+
+        if autoset_seed and best_seed is not None and best_loss < start_loss:
             self.best_seed = best_seed
         return best_seed, best_loss
 
