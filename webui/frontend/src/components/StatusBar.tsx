@@ -32,9 +32,19 @@ export const StatusBar: React.FC = () => {
       <input type="number" value={settings.background_height} step={0.01} min={0} onChange={(e) => updateSetting('background_height', parseFloat(e.target.value) || 0)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-background-height" />
 
       <label style={{ color: 'var(--text-secondary)' }}>Base Layers</label>
-      <span className="w-16 px-1 py-0.5 text-center" style={{ color: 'var(--text-primary)' }} data-testid="global-base-layers">
-        {baseLayers}
-      </span>
+      <input
+        type="number"
+        value={baseLayers}
+        step={1}
+        min={0}
+        onChange={(e) => {
+          const layers = Math.max(0, parseInt(e.target.value) || 0)
+          updateSetting('background_height', parseFloat((layers * layerHeight).toFixed(4)))
+        }}
+        className="w-16 px-1 py-0.5 rounded text-xs text-center"
+        style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }}
+        data-testid="global-base-layers"
+      />
 
       <label style={{ color: 'var(--text-secondary)' }}>Dimension (mm)</label>
       <input type="number" value={settings.stl_output_size} step={1} min={10} onChange={(e) => updateSetting('stl_output_size', parseFloat(e.target.value) || 10)} className="w-16 px-1 py-0.5 rounded text-xs text-center" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border)' }} data-testid="global-stl-size" />

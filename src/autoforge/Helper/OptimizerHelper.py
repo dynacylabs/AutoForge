@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from autoforge.Helper.AmpUtils import get_selected_autocast
 
 
@@ -100,6 +101,58 @@ def deterministic_gumbel_softmax(
 
 
 @torch.jit.script
+def deterministic_gumbel_noise(seeds: torch.Tensor, n_mat: int) -> torch.Tensor:
+    """Gumbel noise for a batch of ``deterministic_rand_like`` draws at once.
+
+    ``deterministic_rand_like(x_of_shape_[M], seed)`` is
+    ``frac(sin(arange(M) + seed) * 43758.5453123)``; this computes that for
+    every seed in ``seeds`` (int64, any shape - flattened to [N]) and returns
+    the corresponding Gumbel noise, shape [N, n_mat].
+
+    Bit-exact vs. the scalar path: the seed is kept in int64 through any
+    offset arithmetic and converted to fp32 exactly once, matching
+    ``torch.arange(M, dtype=torch.float32) + <python int seed>``.
+    """
+    m_idx = torch.arange(n_mat, dtype=torch.float32, device=seeds.device).view(1, n_mat)
+    r = torch.sin(m_idx + seeds.to(torch.float32).view(-1, 1)) * 43758.5453123
+    U = r - torch.floor(r)
+    eps: float = 1e-20
+    return -torch.log(-torch.log(U + eps) + eps)
+
+
+@torch.jit.script
+def batched_layer_material_indices(
+    global_logits: torch.Tensor,  # [L, M]
+    tau: float,
+    seed_base: int,
+) -> torch.Tensor:
+    """Vectorized replacement for the per-layer material-selection loop.
+
+    Exactly reproduces
+    ``argmax(deterministic_gumbel_softmax(global_logits[j], tau, True, seed_base + j))``
+    for every layer ``j``, but in a single kernel instead of ``L`` separate
+    tiny ones. The per-layer loop was measured at ~7.3ms of
+    ``composite_image_disc``'s ~9.8ms forward pass (L=75) - pure Python/launch
+    overhead, since each iteration only touches an [M]-sized tensor.
+
+    The ``softmax`` is kept rather than taking the argmax of the raw
+    ``(logits + gumbel) / tau`` scores. It is mathematically redundant
+    (softmax is monotonic) but preserves the saturation/NaN behaviour at very
+    small tau on large-scale logits that the original path had - see
+    ``material_select_from_logits``'s docstring in PruningHelper.
+
+    Returns:
+        torch.Tensor: int64 [L] of chosen material indices.
+    """
+    L = int(global_logits.shape[0])
+    M = int(global_logits.shape[1])
+    seeds = torch.arange(L, dtype=torch.int64, device=global_logits.device) + seed_base
+    gumbel = deterministic_gumbel_noise(seeds, M)  # [L, M]
+    y_soft = F.softmax((global_logits + gumbel) / tau, dim=-1)
+    return torch.argmax(y_soft, dim=-1)
+
+
+@torch.jit.script
 def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tensor:
     """
     Applies a simple 2D 3x3 average blur to simulate edge bleeding.
@@ -115,15 +168,18 @@ def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tenso
         mask = mask.unsqueeze(0)  # [1,H,W]
     L, H, W = mask.shape
 
-    # 3x3 average kernel
-    kernel = (
-        torch.tensor(
-            [[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=mask.dtype, device=mask.device
-        )
-        / 8.0
-    )  # 8 neighbors
-
-    kernel = kernel.view(1, 1, 3, 3)
+    # 3x3 average kernel over the 8 neighbours (centre excluded).
+    #
+    # Built entirely on-device. The obvious `torch.tensor([[1,1,1],[1,0,1],
+    # [1,1,1]], device=mask.device)` spelling allocates on the CPU and issues
+    # a host->device copy on *every* call - this function runs once per
+    # composite, i.e. once per training step and once per pruning candidate.
+    # It is also an outright blocker for CUDA graph capture ("Cannot copy
+    # between CPU and CUDA tensors during CUDA graph capture"). Values are
+    # identical: 1/8 in the eight neighbour taps, 0 in the centre.
+    taps = torch.full((9,), 0.125, dtype=mask.dtype, device=mask.device)
+    centre = torch.arange(9, device=mask.device) == 4
+    kernel = torch.where(centre, torch.zeros_like(taps), taps).view(1, 1, 3, 3)
 
     # Apply conv2d to each layer independently
     blurred = F.conv2d(mask.unsqueeze(1), kernel, padding=1, groups=1).squeeze(
@@ -134,8 +190,47 @@ def bleed_layer_effect(mask: torch.Tensor, strength: float = 0.1) -> torch.Tenso
     return mask + strength * blurred
 
 
+class _CumprodDim0(torch.autograd.Function):
+    """``torch.cumprod(x, dim=0, dtype=torch.float32)`` with a sync-free backward.
+
+    ATen's ``cumprod_backward`` unconditionally runs ``(input == 0).any().item()``
+    to decide between its zero-free fast path and a general slow path. That
+    ``.item()`` is a device->host copy, i.e. a **full CUDA sync inside the
+    backward pass of every single training step** - it drains the pipeline and
+    serializes CPU kernel-launch with GPU execution, on a step that is
+    otherwise entirely launch-bound. It is also a hard blocker for CUDA graph
+    capture ("operation not permitted when stream is capturing").
+
+    The backward here is ATen's own zero-free formula,
+    ``reverse_cumsum(grad * y) / x``, with the ``x == 0`` positions forced to
+    zero instead of producing 0/0 = NaN. That substitution is safe *for this
+    pipeline* rather than in general: ``x`` here is ``1 - opac`` where ``opac``
+    comes straight out of a ``clamp(..., 0.0, 1.0)``, so ``x == 0`` implies the
+    clamp saturated at its upper bound, and clamp's own backward multiplies
+    that position's gradient by zero anyway. Writing 0 there produces the same
+    downstream gradient as the true value would, while avoiding a NaN that
+    ``0 * NaN`` would otherwise propagate.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        y = torch.cumprod(x, dim=0, dtype=torch.float32)
+        ctx.save_for_backward(x, y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, y = ctx.saved_tensors
+        rev_cumsum = (grad_out * y).flip(0).cumsum(0).flip(0)
+        # Where x[i] == 0 every y[j>=i] is 0 too, so rev_cumsum[i] is exactly
+        # 0; substituting a 1 in the denominator therefore yields 0 rather
+        # than 0/0 = NaN, without needing a separate select afterwards.
+        grad_x = rev_cumsum / x.masked_fill(x == 0, 1.0)
+        return grad_x.to(x.dtype)
+
+
 @torch.jit.script
-def composite_image_cont(
+def _composite_cont_pre(
     pixel_height_logits: torch.Tensor,  # [H,W]
     global_logits: torch.Tensor,  # [L,M]
     tau_height: float,
@@ -144,16 +239,40 @@ def composite_image_cont(
     max_layers: int,
     material_colors: torch.Tensor,  # [M,3]
     material_TDs: torch.Tensor,  # [M]
-    background: torch.Tensor,  # [3]
     compute_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
+    gumbel_exp: Optional[torch.Tensor] = None,  # [L,M] Exponential(1) samples
+):
+    """Everything in the continuous composite up to (and including) the
+    shifted top-to-bottom transmittance stack.
+
+    Split out of ``composite_image_cont`` so the ``cumprod`` in between can go
+    through ``_CumprodDim0`` - a ``torch.autograd.Function`` can't be called
+    from TorchScript, and dropping ``@torch.jit.script`` from the whole
+    composite costs ~40% (2.85ms -> 3.98ms fwd+bwd at L=75, H=W=250), so the
+    scripted region is kept and merely cut in two around it.
+
+    Returns ``(opac_fb, colors_fb, trans_shift)``.
+    """
     # 1. per-pixel continuous layer index
     pixel_height = (max_layers * h) * torch.sigmoid(pixel_height_logits)  # [H,W]
     continuous_z = pixel_height / h  # [H,W]
     continuous_z = adaptive_round(continuous_z, tau_height, 1.0, 0.0, 0.1)
 
     # 2. global material weights with Gumbel-Softmax
-    p_mat = F.gumbel_softmax(global_logits, tau_global, hard=False, dim=1)  # [L,M]
+    #
+    # ``gumbel_exp`` lets the caller supply the Exponential(1) draw that
+    # F.gumbel_softmax would otherwise make internally. That is what keeps
+    # the RNG *outside* a CUDA-graph-captured region: a captured graph gets
+    # its own philox offset sequence on replay, which would silently give a
+    # different noise stream than the eager path. Both branches compute the
+    # identical expression - F.gumbel_softmax(logits, tau, hard=False) is
+    # exactly softmax((logits + -log(Exponential(1))) / tau).
+    if gumbel_exp is None:
+        p_mat = F.gumbel_softmax(global_logits, tau_global, hard=False, dim=1)  # [L,M]
+    else:
+        p_mat = F.softmax(
+            (global_logits + (-torch.log(gumbel_exp))) / tau_global, dim=1
+        )  # [L,M]
 
     layer_colors = p_mat @ material_colors  # [L,3]
     layer_TDs = (p_mat @ material_TDs).clamp(1e-8, 1e8)  # [L]
@@ -205,18 +324,28 @@ def composite_image_cont(
 
     trans_fb = 1.0 - opac_fb  # [L,H,W]
     trans_shift = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
+    return opac_fb, colors_fb, trans_shift
+
+
+@torch.jit.script
+def _composite_cont_post(
+    remain_fb: torch.Tensor,  # [L,H,W] fp32 exclusive cumulative transmittance
+    opac_fb: torch.Tensor,  # [L,H,W]
+    colors_fb: torch.Tensor,  # [L,3]
+    background: torch.Tensor,  # [3]
+    compute_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Top-to-bottom accumulation, given the cumulative transmittance."""
     # cumprod over up to max_layers factors accumulates rounding error each
-    # step; accumulate in fp32 regardless of compute_dtype, then drop back
-    # down so the (larger) downstream tensors still get the memory win.
-    remain_fb = torch.cumprod(trans_shift, dim=0, dtype=torch.float32)
-    del trans_shift
+    # step; it is accumulated in fp32 regardless of compute_dtype, then dropped
+    # back down here so the (larger) downstream tensors still get the memory
+    # win.
     if compute_dtype is not None:
         remain_fb = remain_fb.to(compute_dtype)
 
     comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
         -1, 1, 1, 3
     )  # [L,H,W,3]
-    del opac_fb, colors_fb
 
     # Sum-reduce over layers in fp32 (same reasoning as cumprod above); this
     # also gives us the function's fp32 return dtype for free.
@@ -224,9 +353,190 @@ def composite_image_cont(
     del comp_layers
 
     # 6. background
-    rem_after = remain_fb[-1] * trans_fb[-1]  # remaining after bottom layer
-    del remain_fb, trans_fb
+    rem_after = remain_fb[-1] * (1.0 - opac_fb[-1])  # remaining after bottom layer
     comp = comp + rem_after.to(torch.float32).unsqueeze(-1) * background  # [H,W,3]
+    return comp * 255.0
+
+
+def composite_image_cont(
+    pixel_height_logits: torch.Tensor,  # [H,W]
+    global_logits: torch.Tensor,  # [L,M]
+    tau_height: float,
+    tau_global: float,
+    h: float,
+    max_layers: int,
+    material_colors: torch.Tensor,  # [M,3]
+    material_TDs: torch.Tensor,  # [M]
+    background: torch.Tensor,  # [3]
+    compute_dtype: Optional[torch.dtype] = None,
+    gumbel_exp: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    opac_fb, colors_fb, trans_shift = _composite_cont_pre(
+        pixel_height_logits,
+        global_logits,
+        tau_height,
+        tau_global,
+        h,
+        max_layers,
+        material_colors,
+        material_TDs,
+        compute_dtype,
+        gumbel_exp,
+    )
+    remain_fb = _CumprodDim0.apply(trans_shift)
+    del trans_shift
+    return _composite_cont_post(
+        remain_fb, opac_fb, colors_fb, background, compute_dtype
+    )
+
+
+@torch.jit.script
+def _composite_cont_chunk(
+    continuous_z: torch.Tensor,  # [H,W] fp32, already adaptive_round-ed
+    layer_ids_fb: torch.Tensor,  # [k] fp32, descending original layer indices
+    layer_colors_fb: torch.Tensor,  # [k,3]
+    layer_TDs_fb: torch.Tensor,  # [k]
+    tau_height: float,
+    h: float,
+    compute_dtype: Optional[torch.dtype] = None,
+):
+    """One top-to-bottom slice of the continuous composite.
+
+    Returns ``(contrib, tail)``: the slice's colour contribution assuming full
+    incoming transmittance, and the transmittance it passes on to the slice
+    below. The caller scales ``contrib`` by the running transmittance and
+    multiplies ``tail`` into it, so slices compose exactly the way the
+    unchunked layer loop does.
+
+    Every step here is per-layer independent (the bleed convolution is a
+    per-layer 2D blur), which is what makes the layer axis chunkable at all.
+    """
+    eps: float = 1e-8
+    scale = 10.0 / (tau_height + eps)
+    p_print = torch.sigmoid(
+        (continuous_z.unsqueeze(0) - (layer_ids_fb.view(-1, 1, 1) + 0.5)) * scale
+    )  # [k,H,W]
+
+    if compute_dtype is not None:
+        p_print = p_print.to(compute_dtype)
+        layer_colors_fb = layer_colors_fb.to(compute_dtype)
+        layer_TDs_fb = layer_TDs_fb.to(compute_dtype)
+
+    p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
+    del p_print
+    eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
+    del p_print_bleed
+    thick_ratio = eff_thick / layer_TDs_fb.view(-1, 1, 1)
+    del eff_thick
+
+    o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
+    opac = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
+    del thick_ratio
+    opac = torch.clamp(opac, 0.0, 1.0)  # [k,H,W]
+
+    trans = 1.0 - opac
+    rem_local = torch.cumprod(
+        torch.cat([torch.ones_like(trans[:1]), trans[:-1]], dim=0),
+        dim=0,
+        dtype=torch.float32,
+    )
+    if compute_dtype is not None:
+        rem_local = rem_local.to(compute_dtype)
+
+    comp_layers = (rem_local * opac).unsqueeze(-1) * layer_colors_fb.view(-1, 1, 1, 3)
+    contrib = comp_layers.sum(dim=0, dtype=torch.float32)  # [H,W,3]
+    del comp_layers
+    tail = (rem_local[-1] * trans[-1]).to(torch.float32)  # [H,W]
+    return contrib, tail
+
+
+def composite_image_cont_lowmem(
+    pixel_height_logits: torch.Tensor,  # [H,W]
+    global_logits: torch.Tensor,  # [L,M]
+    tau_height: float,
+    tau_global: float,
+    h: float,
+    max_layers: int,
+    material_colors: torch.Tensor,  # [M,3]
+    material_TDs: torch.Tensor,  # [M]
+    background: torch.Tensor,  # [3]
+    compute_dtype: Optional[torch.dtype] = None,
+    gumbel_exp: Optional[torch.Tensor] = None,
+    layer_chunk: int = 25,
+) -> torch.Tensor:
+    """Memory-lean equivalent of ``composite_image_cont``.
+
+    ``composite_image_cont`` keeps every [L,H,W] intermediate on the autograd
+    tape, and at full output resolution that sets the whole pipeline's VRAM
+    high-water mark. Measured at L=75, H=W~250: 125MB of tape, 158MB forward
+    peak, 204MB across forward+backward.
+
+    Checkpointing the composite as a whole - or either of its two halves -
+    does *not* help: the peak is in the backward, so the recompute simply
+    rebuilds the tape it was supposed to avoid, on top of the inputs the
+    checkpoint still holds (measured: peak allocated went up, not down).
+    What does work is chunking the layer axis and checkpointing each chunk:
+    only [H,W]-sized running state crosses a chunk boundary, so no single
+    tape ever covers more than ``layer_chunk`` layers.
+
+    Not bit-identical to the unchunked version - splitting the transmittance
+    cumprod and the layer sum at chunk boundaries regroups both - so callers
+    should be ones whose result is verified before being kept.
+    """
+    # 1. per-pixel continuous layer index (identical to composite_image_cont)
+    pixel_height = (max_layers * h) * torch.sigmoid(pixel_height_logits)
+    continuous_z = adaptive_round(pixel_height / h, tau_height, 1.0, 0.0, 0.1)
+
+    # 2. global material weights - see composite_image_cont on gumbel_exp
+    if gumbel_exp is None:
+        p_mat = F.gumbel_softmax(global_logits, tau_global, hard=False, dim=1)
+    else:
+        p_mat = F.softmax(
+            (global_logits + (-torch.log(gumbel_exp))) / tau_global, dim=1
+        )
+    layer_colors = p_mat @ material_colors  # [L,3]
+    layer_TDs = (p_mat @ material_TDs).clamp(1e-8, 1e8)  # [L]
+
+    # Top-to-bottom order, so chunk i sits above chunk i+1.
+    colors_fb = torch.flip(layer_colors, dims=[0])
+    TDs_fb = torch.flip(layer_TDs, dims=[0])
+    ids_fb = torch.arange(
+        max_layers - 1, -1, -1, dtype=torch.float32, device=pixel_height.device
+    )
+
+    comp = torch.zeros(
+        pixel_height.shape[0],
+        pixel_height.shape[1],
+        3,
+        dtype=torch.float32,
+        device=pixel_height.device,
+    )
+    remain = torch.ones_like(pixel_height, dtype=torch.float32)
+
+    for start in range(0, max_layers, layer_chunk):
+        stop = min(start + layer_chunk, max_layers)
+        # preserve_rng_state=False: the chunk body draws no random numbers
+        # (the Gumbel sample is taken above), so there is nothing to restore
+        # and saving/restoring the CUDA generator per chunk per step would be
+        # pure overhead. use_reentrant=True because the non-reentrant
+        # implementation wraps saved tensors in hooks that the TorchScript
+        # interpreter rejects on re-entry.
+        contrib, tail = torch.utils.checkpoint.checkpoint(
+            _composite_cont_chunk,
+            continuous_z,
+            ids_fb[start:stop],
+            colors_fb[start:stop],
+            TDs_fb[start:stop],
+            tau_height,
+            h,
+            compute_dtype,
+            use_reentrant=True,
+            preserve_rng_state=False,
+        )
+        comp = comp + remain.unsqueeze(-1) * contrib
+        remain = remain * tail
+
+    comp = comp + remain.unsqueeze(-1) * background
     return comp * 255.0
 
 
@@ -271,6 +581,7 @@ def composite_image_disc(
     background: torch.Tensor,  # [3]
     rng_seed: int = -1,
     compute_dtype: Optional[torch.dtype] = None,
+    layer_chunk: int = 25,
 ) -> torch.Tensor:
     """
     Discrete counterpart of `composite_image_cont`.
@@ -299,82 +610,81 @@ def composite_image_disc(
     L: int = int(global_logits.shape[0])
     n_mat: int = int(global_logits.shape[1])
 
-    layer_colors: torch.Tensor = torch.empty(
-        (L, 3), dtype=material_colors.dtype, device=material_colors.device
-    )
-    layer_TDs: torch.Tensor = torch.empty(
-        (L,), dtype=material_TDs.dtype, device=material_TDs.device
-    )
-
     seed_base: int = rng_seed if rng_seed >= 0 else 0
-    hard_flag: bool = True  # always one-hot
-    for j in range(L):
-        seed_j: int = seed_base + j
-        one_hot: torch.Tensor = deterministic_gumbel_softmax(
-            global_logits[j], tau_global, hard_flag, seed_j
-        )  # [n_materials]
-        idx = torch.argmax(one_hot, dim=-1)
-        layer_colors[j] = material_colors[idx]
-        layer_TDs[j] = material_TDs[idx].clamp(1e-8, 1e8)
+    sel = batched_layer_material_indices(global_logits, tau_global, seed_base)  # [L]
+    layer_colors = material_colors.index_select(0, sel)  # [L,3]
+    layer_TDs = material_TDs.index_select(0, sel).clamp(1e-8, 1e8)  # [L]
 
-    # 3. Binary print mask: a layer is present iff its index < z_int.
-    layer_idx: torch.Tensor = torch.arange(
-        max_layers, dtype=torch.int64, device=pixel_height.device
-    ).view(-1, 1, 1)  # [L,1,1]
-    p_print: torch.Tensor = (layer_idx < z_int.unsqueeze(0)).to(
-        pixel_height.dtype
-    )  # [L,H,W]
-
-    # See composite_image_cont: @torch.jit.script does not observe ambient
-    # torch.autocast, so cast explicitly here to get the memory win for the
-    # per-layer compositing pipeline below.
-    if compute_dtype is not None:
-        p_print = p_print.to(compute_dtype)
-        layer_colors = layer_colors.to(compute_dtype)
-        layer_TDs = layer_TDs.to(compute_dtype)
-
-    # 4. Thickness, opacity and the rest exactly as in the continuous version.
-    p_print_bleed = bleed_layer_effect(p_print, strength=0.1)  # [L,H,W]
-    del p_print
-    eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
-    del p_print_bleed
-    thick_ratio: torch.Tensor = eff_thick / layer_TDs.view(-1, 1, 1)  # [L,H,W]
-    del eff_thick
+    # 3-6. Walk the stack top-to-bottom in chunks of `layer_chunk` layers.
+    #
+    # Every step from the binary print mask through the opacity curve is
+    # per-layer independent (the bleed is a per-layer 2D blur), so the layer
+    # axis chunks cleanly: only the [H,W] running transmittance and the
+    # [H,W,3] accumulated colour cross a chunk boundary. That bounds the
+    # working set by the chunk instead of by max_layers, which matters
+    # because this function runs at full *output* resolution in every pruning
+    # phase - a single [L,H,W] tensor is 18MB at stl_output_size=50 but
+    # 169MB at the tool's default 150.
+    H_out: int = int(z_int.shape[0])
+    W_out: int = int(z_int.shape[1])
+    comp = torch.zeros(
+        (H_out, W_out, 3), dtype=torch.float32, device=pixel_height.device
+    )
+    remain = torch.ones(
+        (H_out, W_out), dtype=torch.float32, device=pixel_height.device
+    )
 
     o, A, k, b = -2.9864511e-02, 4.0532556e-01, 8.2597107e+01, 1.2547257e+00
-    opac: torch.Tensor = o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio)
-    del thick_ratio
-    opac = torch.clamp(opac, 0.0, 1.0)  # [L,H,W]
 
-    # 5. Top-to-bottom compositing (same flipping trick as before).
-    opac_fb = torch.flip(opac, dims=[0])  # [L,H,W]
-    del opac
-    colors_fb = torch.flip(layer_colors, dims=[0])  # [L,3]
-    del layer_colors
+    hi: int = max_layers
+    while hi > 0:
+        lo: int = hi - layer_chunk
+        if lo < 0:
+            lo = 0
+        # Descending layer indices so each chunk is ordered top-to-bottom,
+        # matching the direction the transmittance accumulates in.
+        idx = torch.arange(
+            lo, hi, dtype=torch.int64, device=pixel_height.device
+        ).flip([0])
+        p_print = (idx.view(-1, 1, 1) < z_int.unsqueeze(0)).to(
+            pixel_height.dtype
+        )  # [k,H,W]
+        cols_c = layer_colors[lo:hi].flip([0])
+        tds_c = layer_TDs[lo:hi].flip([0])
 
-    trans_fb = 1.0 - opac_fb  # [L,H,W]
-    trans_prev = torch.cat([torch.ones_like(trans_fb[:1]), trans_fb[:-1]], dim=0)
-    # Accumulate cumprod/sum in fp32 regardless of compute_dtype (rounding
-    # error compounds over up to max_layers steps), then drop back down so
-    # the larger downstream tensor still gets the memory win.
-    remain_fb = torch.cumprod(trans_prev, dim=0, dtype=torch.float32)  # [L,H,W]
-    del trans_prev
-    if compute_dtype is not None:
-        remain_fb = remain_fb.to(compute_dtype)
+        # See composite_image_cont: @torch.jit.script does not observe
+        # ambient torch.autocast, so cast explicitly here.
+        if compute_dtype is not None:
+            p_print = p_print.to(compute_dtype)
+            cols_c = cols_c.to(compute_dtype)
+            tds_c = tds_c.to(compute_dtype)
 
-    comp_layers = (remain_fb * opac_fb).unsqueeze(-1) * colors_fb.view(
-        -1, 1, 1, 3
-    )  # [L,H,W,3]
-    del opac_fb, colors_fb
+        p_print_bleed = bleed_layer_effect(p_print, strength=0.1)
+        eff_thick = torch.clamp(p_print_bleed, 0.0, 1.0) * h
+        thick_ratio = eff_thick / tds_c.view(-1, 1, 1)
+        opac = torch.clamp(
+            o + (A * torch.log1p(k * thick_ratio) + b * thick_ratio), 0.0, 1.0
+        )
+        trans = 1.0 - opac
+        # Accumulate cumprod/sum in fp32 regardless of compute_dtype
+        # (rounding error compounds across layers), then drop back down so
+        # the larger downstream tensor still gets the memory win.
+        rem_local = torch.cumprod(
+            torch.cat([torch.ones_like(trans[:1]), trans[:-1]], dim=0),
+            dim=0,
+            dtype=torch.float32,
+        )
+        if compute_dtype is not None:
+            rem_local = rem_local.to(compute_dtype)
 
-    comp = comp_layers.sum(dim=0, dtype=torch.float32)  # [H,W,3]
-    del comp_layers
+        contrib = ((rem_local * opac).unsqueeze(-1) * cols_c.view(-1, 1, 1, 3)).sum(
+            dim=0, dtype=torch.float32
+        )  # [H,W,3]
+        comp = comp + remain.unsqueeze(-1) * contrib
+        remain = remain * (rem_local[-1] * trans[-1]).to(torch.float32)
+        hi = lo
 
-    # 6. Background
-    rem_after = remain_fb[-1] * trans_fb[-1]
-    del remain_fb, trans_fb
-    comp = comp + rem_after.to(torch.float32).unsqueeze(-1) * background  # [H,W,3]
-
+    comp = comp + remain.unsqueeze(-1) * background  # [H,W,3]
     return comp * 255.0
 
 

@@ -1,3 +1,9 @@
+/* Theme: default is dark (the app's original, only look). Toggling adds
+   data-theme="light" to <html>, which the blocks below override. Anything
+   that reads one of these custom properties — inline `var(--bg-panel)`
+   styles throughout the app, and the Tailwind `gray-*` utility classes
+   aliased to --gray-* below — re-themes automatically; no per-component
+   className changes needed. */
 :root {
   --bg-main: #0f1c2a;
   --bg-panel: #162435;
@@ -12,6 +18,53 @@
   --cyan-accent: #00f0ff;
   --green-accent: #2dfc73;
   --purple-accent: #7970ff;
+
+  /* Tailwind's default `gray` scale, as RGB triplets so tailwind.config.js
+     can alias the bg-gray, text-gray and border-gray utility classes (used
+     throughout the app) to `rgb(var(--gray-XXX) / <alpha-value>)` — still
+     supports opacity modifiers like bg-gray-900/80. Values match
+     Tailwind's stock gray so dark mode (the default) looks pixel-identical
+     to before this existed. */
+  --gray-100: 243 244 246;
+  --gray-200: 229 231 235;
+  --gray-300: 209 213 219;
+  --gray-400: 156 163 175;
+  --gray-500: 107 114 128;
+  --gray-600: 75 85 99;
+  --gray-700: 55 65 81;
+  --gray-800: 31 41 55;
+  --gray-900: 17 24 39;
+}
+
+:root[data-theme="light"] {
+  --bg-main: #f4f6f9;
+  --bg-panel: #ffffff;
+  --bg-toolbar: #e2e8f0;
+  --bg-toolbar-dark: #cbd5e1;
+  --bg-sidebar: #eef2f7;
+  --bg-input: #ffffff;
+  --border: #cbd5e1;
+  --border-light: #94a3b8;
+  --text-primary: #0f172a;
+  --text-secondary: #47556b;
+  --cyan-accent: #0891b2;
+  --green-accent: #15803d;
+  --purple-accent: #6d28d9;
+
+  /* The neutral ramp is inverted, not just lightened: the slot each
+     className reaches for (e.g. bg-gray-900 for a panel background,
+     text-gray-300 for a label) keeps the same *role* — "darkest surface",
+     "readable secondary text" — across both themes, it's just that role's
+     concrete color that flips from near-black to near-white and back. */
+  --gray-900: 248 250 252;
+  --gray-800: 241 245 249;
+  --gray-700: 226 232 240;
+  --gray-600: 203 213 225;
+  --gray-500: 100 116 139;
+  --gray-400: 71 85 105;
+  --gray-300: 51 65 85;
+  --gray-200: 30 41 59;
+  --gray-100: 15 23 42;
 }
 
 @layer base {
@@ -37,6 +90,28 @@
     --ring: 188 100% 51%;
     --radius: 0.5rem;
   }
+
+  :root[data-theme="light"] {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 191 91% 37%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 20% 90%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 20% 92%;
+    --muted-foreground: 215 16% 40%;
+    --accent: 191 91% 37%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 20% 84%;
+    --input: 214 20% 84%;
+    --ring: 191 91% 37%;
+  }
 }
 
 @tailwind base;
@@ -47,18 +122,78 @@
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color-scheme: light dark;
+  color-scheme: dark;
   color: rgba(255, 255, 255, 0.87);
   background-color: #242424;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  color: #0f172a;
+  background-color: #f4f6f9;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background-color: var(--bg-main);
 }
 
 #root {
   width: 100%;
   height: 100vh;
+}
+
+/* Color Sliders panel's per-column layer slider — the default native thumb
+   is quite large relative to these narrow (12px) vertical tracks. Scoped to
+   this class so it doesn't also shrink the RGB sliders in the filament
+   editor dialogs. */
+.af-vertical-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+.af-vertical-slider::-webkit-slider-runnable-track {
+  width: 4px;
+  background: var(--border-light, #6b7280);
+  border-radius: 2px;
+}
+
+.af-vertical-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--cyan-accent, #22d3ee);
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  margin-top: 0;
+  cursor: pointer;
+}
+
+.af-vertical-slider:disabled::-webkit-slider-thumb {
+  background: #6b7280;
+  cursor: not-allowed;
+}
+
+.af-vertical-slider::-moz-range-track {
+  width: 4px;
+  background: var(--border-light, #6b7280);
+  border-radius: 2px;
+}
+
+.af-vertical-slider::-moz-range-thumb {
+  width: 10px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--cyan-accent, #22d3ee);
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+.af-vertical-slider:disabled::-moz-range-thumb {
+  background: #6b7280;
+  cursor: not-allowed;
 }

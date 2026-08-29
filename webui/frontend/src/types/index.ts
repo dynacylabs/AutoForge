@@ -102,4 +102,5 @@ export interface Snapshot {
   inputImage?: string | null
   currentJobId?: string | null
   optimizationResultId?: string | null
+  jobStatus?: string | null
 }

@@ -1,7 +1,8 @@
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect, useMemo, useRef } from 'react'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
+import { getOverlapDisabledIndices } from '../lib/colorStack'
 
 export const ColorSliders: React.FC = () => {
   const colorSliders = useAppStore((s) => s.colorSliders)
@@ -18,14 +19,15 @@ export const ColorSliders: React.FC = () => {
   // pre-run) init-preview state, which may never run at all if a job was
   // started directly via the API.
   const hasResult = currentJob?.status === 'completed'
+  const jobId = currentJob?.job_id
 
-  const triggerPreviewRender = useDebouncedCallback(async (sliders: typeof colorSliders, filaments: Filament[]) => {
+  const triggerPreviewRender = useDebouncedCallback(async (sliders: typeof colorSliders, filaments: Filament[], jobId: string | undefined) => {
     setIsRendering(true)
     try {
       await fetch('/api/preview/render-with-sliders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sliders, active_filaments: filaments }),
+        body: JSON.stringify({ sliders, active_filaments: filaments, job_id: jobId }),
       })
     } catch {
       // Ignore — the WS-driven preview simply won't update this round.
@@ -46,11 +48,17 @@ export const ColorSliders: React.FC = () => {
     })
 
     if (hasChanges) {
-      triggerPreviewRender(colorSliders, activeFilaments)
+      triggerPreviewRender(colorSliders, activeFilaments, jobId)
     }
 
     lastRenderedSlidersRef.current = currentKey
-  }, [colorSliders, hasResult, activeFilaments, triggerPreviewRender])
+  }, [colorSliders, hasResult, activeFilaments, jobId, triggerPreviewRender])
+
+  // Sliders can now be dragged onto the same layer as one another; when that
+  // happens only the right-most one actually governs that layer's material
+  // (matches ColorCore), so its overlapped neighbors are dimmed here as a
+  // silent "this one currently has no effect" cue.
+  const overlapDisabled = useMemo(() => getOverlapDisabledIndices(colorSliders, filaments), [colorSliders, filaments])
 
   const findFilament = (uuid: string): Filament | undefined => {
     if (!uuid) return undefined
@@ -80,6 +88,17 @@ export const ColorSliders: React.FC = () => {
     updateSlider(index, { layer })
   }
 
+  const handleWheel = (index: number, currentLayer: number, enabled: boolean) => (e: React.WheelEvent) => {
+    if (!enabled) return
+    e.preventDefault()
+    // Wheel up (deltaY < 0) raises the layer, matching the slider's own
+    // "up = higher layer" direction (it's inverted top-to-bottom via
+    // writingMode/direction below), so the two never feel backwards.
+    const step = e.deltaY < 0 ? 1 : -1
+    const next = Math.min(sliderLayerRange.max, Math.max(sliderLayerRange.min, currentLayer + step))
+    if (next !== currentLayer) handleLayerChange(index, next)
+  }
+
   return (
     <div style={{ backgroundColor: 'var(--bg-panel)', borderTop: '1px solid var(--border)' }} data-testid="color-sliders-panel">
       {/* Header */}
@@ -98,13 +117,16 @@ export const ColorSliders: React.FC = () => {
           const filament = findFilament(slider.filament_uuid)
           const color = filament?.color ?? '#333333'
           const label = filament ? filament.name : slider.enabled ? 'Empty' : ''
+          const isOverlapDisabled = overlapDisabled.has(i)
           return (
             <div
               key={i}
-              style={{ width: 50, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, fontSize: 10 }}
+              style={{ width: 50, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, fontSize: 10, opacity: isOverlapDisabled ? 0.45 : 1 }}
               onDrop={(e) => handleDrop(e, i)}
               onDragOver={handleDragOver}
               data-testid={`slider-column-${i}`}
+              data-overlap-disabled={isOverlapDisabled || undefined}
+              title={isOverlapDisabled ? 'This filament is covered by another slider on the same layer' : undefined}
             >
               <div style={{ fontSize: 7, color: 'var(--text-secondary)', letterSpacing: 0.5 }}>TD</div>
               <input
@@ -122,8 +144,10 @@ export const ColorSliders: React.FC = () => {
                 min={sliderLayerRange.min}
                 max={sliderLayerRange.max}
                 onChange={(e) => handleLayerChange(i, parseInt(e.target.value) || 0)}
+                onWheel={handleWheel(i, slider.layer, slider.enabled)}
                 disabled={!slider.enabled}
-                style={{ height: 40, width: 12, writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
+                className="af-vertical-slider"
+                style={{ height: 70, width: 12, writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
                 data-testid={`slider-${i}`}
               />
               <input

@@ -134,40 +134,82 @@ class FilamentService:
             rows.append(normalized)
         return rows
 
-    def import_csv(self, content: str, _mark_user_import: bool = True) -> list[Filament]:
-        with self._lock:
-            imported = []
-            reader = csv.DictReader(content.splitlines())
-            rows = self._normalize_csv_row(reader)
-            for row in rows:
-                td_str = row.get("TD") or row.get("td") or row.get("Transmissivity", "")
-                try:
-                    td_val = float(td_str) if td_str else 0.0
-                except (ValueError, TypeError):
-                    td_val = 0.0
-                f = Filament(
+    def _parse_csv(self, content: str) -> list[Filament]:
+        reader = csv.DictReader(content.splitlines())
+        rows = self._normalize_csv_row(reader)
+        parsed = []
+        for row in rows:
+            td_str = row.get("TD") or row.get("td") or row.get("Transmissivity", "")
+            try:
+                td_val = float(td_str) if td_str else 0.0
+            except (ValueError, TypeError):
+                td_val = 0.0
+            parsed.append(
+                Filament(
                     brand=row.get("Brand", row.get("brand", "")),
                     name=row.get("Name", row.get("name", "")),
                     color=row.get("Color", row.get("color", "#ffffff")),
                     td=td_val,
-                    uuid=row.get("UUID", row.get("uuid", str(uuid.uuid4()))),
+                    # Leave uuid blank when the source doesn't have one —
+                    # merge_import()/replace_library() are responsible for
+                    # assigning one, since merge_import needs to know
+                    # "no uuid was given" to try matching by name instead.
+                    uuid=row.get("UUID", row.get("uuid", "")) or "",
                     filament_type=row.get("Type", row.get("filament_type", "")),
                 )
+            )
+        return parsed
+
+    def _match_key(self, f: Filament) -> tuple[str, str]:
+        return (f.brand.strip().lower(), f.name.strip().lower())
+
+    def merge_import(self, filaments: list[Filament]) -> list[Filament]:
+        """Add filaments into the existing library. An incoming filament
+        whose (brand, name) matches an existing one overwrites it in place
+        (keeping its uuid, so active-filament references and slider
+        assignments referencing that uuid keep working) instead of adding a
+        duplicate entry — this is what re-importing the same CSV/updated
+        pricing sheet/etc. is expected to do."""
+        with self._lock:
+            existing_by_key = {self._match_key(f): f.uuid for f in self._filaments.values()}
+            imported = []
+            for f in filaments:
+                key = self._match_key(f)
+                if key in existing_by_key:
+                    f.uuid = existing_by_key[key]
+                elif not f.uuid:
+                    f.uuid = str(uuid.uuid4())
                 self._filaments[f.uuid] = f
                 imported.append(f)
             self._save_library()
+            return imported
+
+    def replace_library(self, filaments: list[Filament]) -> list[Filament]:
+        """Replace the entire filament library with exactly these
+        filaments — everything not in this list is removed."""
+        with self._lock:
+            self._filaments = {}
+            imported = []
+            for f in filaments:
+                if not f.uuid:
+                    f.uuid = str(uuid.uuid4())
+                self._filaments[f.uuid] = f
+                imported.append(f)
+            self._save_library()
+            return imported
+
+    def import_csv(self, content: str, mode: str = "merge", _mark_user_import: bool = True) -> list[Filament]:
+        with self._lock:
+            parsed = self._parse_csv(content)
+            imported = self.replace_library(parsed) if mode == "replace" else self.merge_import(parsed)
             if _mark_user_import:
                 self._mark_user_imported()
             return imported
 
-    def import_json(self, data: list[dict]) -> list[Filament]:
+    def import_json(self, data: list[dict], mode: str = "merge") -> list[Filament]:
         with self._lock:
-            imported = []
-            for item in data:
-                f = Filament(**item)
-                self._filaments[f.uuid] = f
-                imported.append(f)
-            self._save_library()
+            parsed = [Filament(**item) for item in data]
+            imported = self.replace_library(parsed) if mode == "replace" else self.merge_import(parsed)
             self._mark_user_imported()
             return imported
 

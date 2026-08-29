@@ -21,8 +21,8 @@ def _latest_completed_job():
 
 @router.post("/render-with-sliders")
 async def render_preview(data: dict):
-    """Recompute the composite preview + colored PLY for the most recent
-    completed optimization job, using an edited color-slider stack.
+    """Recompute the composite preview + colored PLY for a completed
+    optimization job, using an edited color-slider stack.
 
     The per-pixel height solution from that job is unchanged — only the
     layer→material assignment (and therefore the compositing) is redone,
@@ -32,7 +32,22 @@ async def render_preview(data: dict):
     svc = get_optimization_service()
     filament_svc = get_filament_service()
 
-    job = _latest_completed_job()
+    # The frontend tells us which job it's actually looking at (its
+    # `currentJob`). Without this we'd guess "most recently started
+    # completed job", which silently diverges from the frontend's job once
+    # the user has more than one completed run (e.g. after browsing History
+    # or undoing to an older result) — the broadcast below is filtered by
+    # job_id client-side, so a wrong guess here means the edit is computed
+    # correctly but the client drops the update on the floor and the 3D
+    # preview never refreshes.
+    requested_job_id = data.get("job_id")
+    job = None
+    if requested_job_id:
+        candidate = svc.get_job(requested_job_id)
+        if candidate and candidate.status == "completed":
+            job = candidate
+    if job is None:
+        job = _latest_completed_job()
     if job is None:
         raise HTTPException(400, "No completed optimization result to render")
 
@@ -54,6 +69,16 @@ async def render_preview(data: dict):
         return {"status": "no_solution", "job_id": job.job_id}
 
     if result["image_b64"]:
-        broadcast_preview(result["image_b64"], job_id=job.job_id, sliders=sliders)
+        # Deliberately NOT echoing `sliders` back here. The frontend is the
+        # source of truth for its own edit — it already has this exact data
+        # before the request goes out. Echoing it back over the shared /ws/
+        # preview channel raced with any edit the user made *while this
+        # request was in flight*: an older, now-stale echo could land after
+        # a newer local change and silently overwrite it (sliders "snapping
+        # back" to a previous position, or edits that intermittently didn't
+        # stick). Optimization/pruning broadcasts still send `sliders`
+        # because those genuinely carry new information the frontend
+        # doesn't have (the server-derived stack from a fresh solution).
+        broadcast_preview(result["image_b64"], job_id=job.job_id)
 
     return {"status": "ok", "job_id": job.job_id, "slider_count": len(sliders)}

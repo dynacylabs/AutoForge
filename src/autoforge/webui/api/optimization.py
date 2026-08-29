@@ -47,9 +47,35 @@ async def start_optimization(settings: OptimizationSettings):
                 settings.iterations,
                 len(filament_svc.get_active()))
 
+    # Validate up front, synchronously, before creating/starting a job — the
+    # job used to be created and flipped to "running" first, with these same
+    # checks only run *inside* the background thread a moment later. That
+    # meant "no active filaments" or "no input image" briefly looked like a
+    # real run (status: running) before immediately failing, instead of
+    # being rejected outright.
+    active = filament_svc.get_active()
+    if not active:
+        raise HTTPException(
+            400,
+            "Add at least one active filament before running optimization. "
+            "Open the Filament Library panel, find a filament and drag it "
+            "onto the 'Active Filaments' area, or click the '+' button to "
+            "add it to the active list.",
+        )
+    input_image_path = settings_dict.get("input_image", "")
+    if not input_image_path:
+        raise HTTPException(400, "Upload an input image before running optimization.")
+
+    filament_dicts = [
+        {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
+         "brand": f.brand, "uuid": f.uuid, "filament_type": f.filament_type}
+        for f in active
+    ]
+
     job = svc.create_job(settings_dict)
 
     def _run():
+        nonlocal input_image_path
         try:
             svc.update_status(job.job_id, "running",
                               total_iterations=settings.iterations)
@@ -57,28 +83,6 @@ async def start_optimization(settings: OptimizationSettings):
 
             output_dir = os.path.join(config.checkpoints_path, job.job_id)
             os.makedirs(output_dir, exist_ok=True)
-
-            active = filament_svc.get_active()
-            filament_dicts = [
-                {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
-                 "brand": f.brand, "uuid": f.uuid, "filament_type": f.filament_type}
-                for f in active
-            ]
-
-            if not filament_dicts:
-                err = ("No active filaments found. Open the Filament Library panel, "
-                       "find a filament and drag it onto the 'Active Filaments' area, "
-                       "or click the '+' button to add it to the active list.")
-                logger.error(err)
-                svc.update_status(job.job_id, "failed", error=err)
-                return
-
-            # Resolve input image path
-            input_image_path = settings_dict.get("input_image", "")
-            if not input_image_path:
-                svc.update_status(job.job_id, "failed",
-                                  error="No input image specified")
-                return
 
             # Resolve path: try as-is, then under uploads directory
             if not os.path.exists(input_image_path):
@@ -234,6 +238,15 @@ async def get_status(job_id: str):
     job = svc.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    return job.model_dump()
+
+
+@router.get("/latest")
+async def get_latest_job():
+    svc = get_optimization_service()
+    job = svc.get_latest_job()
+    if not job:
+        raise HTTPException(404, "No jobs yet")
     return job.model_dump()
 
 

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import random
 import os
 import threading
@@ -12,9 +13,9 @@ from tqdm import tqdm
 
 from autoforge.Helper.CAdamW import CAdamW
 from autoforge.Helper.OptimizerHelper import (
+    batched_layer_material_indices,
     composite_image_cont,
     composite_image_disc,
-    deterministic_gumbel_softmax,
     PrecisionManager,
 )
 
@@ -245,6 +246,30 @@ class FilamentOptimizer:
             lr=self.learning_rate,
         )
 
+        # Persistent Exponential(1) buffer for the material Gumbel-Softmax.
+        # Drawing the noise here, in `step`, instead of letting
+        # F.gumbel_softmax draw it inside composite_image_cont is what allows
+        # the forward/backward to be CUDA-graph-captured without changing the
+        # random stream: a captured graph replays with its own philox offset
+        # sequence, so any RNG *inside* the capture silently diverges from the
+        # eager path. See composite_image_cont's gumbel_exp argument.
+        self._gumbel_exp = torch.empty_like(self.params["global_logits"])
+
+        # CUDA graph state for the training step (see _maybe_capture_graph).
+        self._graph = None
+        self._graph_loss = None
+        self._graph_tau = None
+        self._graph_attempted = False
+        self._graph_enabled = bool(getattr(args, "cuda_graph", True))
+        # Capture only after a few real steps. Those steps double as the
+        # warmup that CUDA graph capture requires (every lazily-initialized
+        # handle, workspace and .grad buffer already exists by then), which is
+        # why there is no separate side-stream warmup: running one costs a
+        # second per-stream allocator pool for no benefit here - measured
+        # peak reserved 220MB with a side-stream warmup vs 178MB without,
+        # against 132MB for the eager baseline.
+        self._graph_capture_after = 3
+
         # Setup best discrete solution tracking
         self.best_discrete_loss = float("inf")
         self.best_params = None
@@ -399,38 +424,14 @@ class FilamentOptimizer:
             )
             return t, t
 
-    def step(self, record_best: bool = False):
+    def _forward_backward(self, tau_height: float, tau_global: float):
+        """Forward + backward for one training step (no parameter update).
+
+        Split out of ``step`` so exactly this region can be CUDA-graph
+        captured: it touches only static buffers (frozen base logits, target,
+        material tables, the two parameters and their .grad tensors, and the
+        pre-drawn ``_gumbel_exp``) and contains no RNG and no host sync.
         """
-        Perform exactly one gradient-descent update step.
-
-        Args:
-            record_best (bool, optional): Whether to record the best discrete solution. Defaults to False.
-
-        Returns:
-            torch.Tensor: A detached 0-dim tensor holding the loss value of the current
-            step. Call `.item()` on it when a Python float is actually needed (e.g. for
-            display) - deferring that sync is the point (see note below).
-        """
-        if self.pixel_height_logits.grad is not None:
-            self.pixel_height_logits.grad = None
-
-        self.optimizer.zero_grad()
-
-        warmup_steps = int(
-            self.args.iterations * self.args.learning_rate_warmup_fraction
-        )
-
-        if self.num_steps_done < warmup_steps and warmup_steps > 0:
-            lr_scale = self.num_steps_done / warmup_steps
-            self.current_learning_rate = lr_scale * self.learning_rate
-        else:
-            self.current_learning_rate = self.learning_rate
-
-        for g in self.optimizer.param_groups:
-            g["lr"] = self.current_learning_rate
-
-        tau_height, tau_global = self._get_tau()
-
         effective_logits = self._apply_height_offset()
 
         loss = loss_fn(
@@ -450,9 +451,170 @@ class FilamentOptimizer:
             focus_map=self.focus_map,
             alpha=self.alpha,
             compute_dtype=self.composite_compute_dtype,
+            gumbel_exp=self._gumbel_exp,
         )
 
-        self.precision.backward_and_step(loss, self.optimizer)
+        if self.precision.scaler is not None:
+            self.precision.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        return loss
+
+    def _optimizer_step(self):
+        """The parameter update half of ``PrecisionManager.backward_and_step``."""
+        if self.precision.scaler is not None:
+            self.precision.scaler.step(self.optimizer)
+            self.precision.scaler.update()
+        else:
+            self.optimizer.step()
+
+    def _maybe_capture_graph(self, tau_height: float, tau_global: float) -> None:
+        """Capture the forward/backward of one training step into a CUDA graph.
+
+        The training step is dominated by kernel-launch overhead rather than
+        GPU work at realistic solver resolutions (measured at the default
+        stl_output_size=50 -> 122x125 solver image: ~3.7ms wall per step of
+        which only ~1.6ms is GPU-busy; a 62x smaller image ran at the same
+        wall time). Replaying a captured graph collapses ~340 dispatched aten
+        ops into a single launch: 3.74ms -> 1.61ms per step.
+
+        Only the forward/backward is captured, not the optimizer step -
+        CAdamW's bias correction derives its ``step_size`` from a Python-side
+        step counter, which a capture would freeze at its capture-time value
+        (bias_correction2 is still ~0.06 that early, i.e. an effective LR ~4x
+        too small for the rest of training). Capturing the optimizer as well
+        measured only 1.57ms vs 1.61ms, so there is nothing to gain from
+        working around that.
+
+        Capture is side-effect free: the warmup passes only accumulate into
+        .grad (parameters are untouched by forward/backward), the RNG draw
+        lives outside, and grads are zeroed afterwards.
+        """
+        if (
+            not self._graph_enabled
+            or self._graph_attempted
+            or self.num_steps_done < self._graph_capture_after
+            or self.device.type != "cuda"
+            or self.precision.scaler is not None
+        ):
+            return
+        self._graph_attempted = True
+        try:
+            # Return the eager path's cached-but-free blocks to the driver so
+            # the graph's private pool grows from a clean state instead of on
+            # top of them (the private pool cannot reuse main-pool blocks).
+            torch.cuda.empty_cache()
+            self.optimizer.zero_grad(set_to_none=False)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_loss = self._forward_backward(tau_height, tau_global)
+            # Keep only the storage, not the autograd graph - replays are pure
+            # kernel replays and never touch autograd, and holding the graph
+            # would pin capture-stream AccumulateGrad nodes for any later
+            # eager fallback step.
+            self._graph_loss = captured_loss.detach()
+            del captured_loss
+            self._graph = graph
+            self._graph_tau = (tau_height, tau_global)
+        except Exception as exc:  # pragma: no cover - hardware/driver dependent
+            self._graph = None
+            self._graph_loss = None
+            self._graph_tau = None
+            print(f"CUDA graph capture unavailable ({exc}); using eager steps.")
+        finally:
+            self.optimizer.zero_grad(set_to_none=False)
+
+    def release_cuda_graph(self) -> None:
+        """Drop the captured graph and its private memory pool.
+
+        Called once training finishes so the pool can be reclaimed before the
+        (higher-resolution, more memory-hungry) post-processing phases run.
+        """
+        if self._graph is None:
+            return
+        # Every kernel from the last replay has to have finished before the
+        # graph's private pool goes away.
+        torch.cuda.synchronize()
+        if self.loss is not None:
+            # self.loss aliases the graph's private pool; detach it from that
+            # storage before the pool goes away.
+            self.loss = self.loss.clone()
+        # The teardown order below is load-bearing. Calling empty_cache()
+        # while the CUDAGraph object is still reachable - it is kept alive by
+        # a reference cycle, so simply dropping the last name is not enough -
+        # makes the run die with "an illegal memory access was encountered"
+        # at the next sync. Reproduced 2/2 at --iterations 20 and fixed 3/3
+        # by forcing the collection first; longer runs happened to hide it
+        # because something else synced in between. reset() releases the pool
+        # explicitly instead of relying on the finalizer, and gc.collect()
+        # then guarantees the object itself is gone before empty_cache().
+        self._graph.reset()
+        self._graph = None
+        self._graph_loss = None
+        self._graph_tau = None
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    def step(self, record_best: bool = False):
+        """
+        Perform exactly one gradient-descent update step.
+
+        Args:
+            record_best (bool, optional): Whether to record the best discrete solution. Defaults to False.
+
+        Returns:
+            torch.Tensor: A detached 0-dim tensor holding the loss value of the current
+            step. Call `.item()` on it when a Python float is actually needed (e.g. for
+            display) - deferring that sync is the point (see note below).
+        """
+        if self.pixel_height_logits.grad is not None:
+            self.pixel_height_logits.grad = None
+
+        # set_to_none=False keeps every .grad tensor at a stable address, which
+        # a captured CUDA graph requires (it replays writes to the exact
+        # buffers recorded at capture time). Numerically a no-op: backward
+        # accumulates onto exact zeros instead of assigning a fresh tensor.
+        self.optimizer.zero_grad(set_to_none=False)
+
+        warmup_steps = int(
+            self.args.iterations * self.args.learning_rate_warmup_fraction
+        )
+
+        if self.num_steps_done < warmup_steps and warmup_steps > 0:
+            lr_scale = self.num_steps_done / warmup_steps
+            self.current_learning_rate = lr_scale * self.learning_rate
+        else:
+            self.current_learning_rate = self.learning_rate
+
+        for g in self.optimizer.param_groups:
+            g["lr"] = self.current_learning_rate
+
+        tau_height, tau_global = self._get_tau()
+
+        # Draw this step's Gumbel noise here, outside any captured region, so
+        # the eager and CUDA-graph paths consume the identical random stream.
+        self._gumbel_exp.exponential_()
+
+        if self._graph is not None and self._graph_tau == (tau_height, tau_global):
+            self._graph.replay()
+            loss = self._graph_loss
+            self._optimizer_step()
+        else:
+            loss = self._forward_backward(tau_height, tau_global)
+            self._optimizer_step()
+            # Drop the reference to this step's autograd graph *before*
+            # attempting capture. A live graph keeps its AccumulateGrad nodes
+            # alive, and those are cached per-parameter and reused - so the
+            # capture would inherit AccumulateGrad nodes bound to the default
+            # stream, which makes the capture stream depend on the legacy
+            # stream and aborts capture with cudaErrorStreamCaptureImplicit
+            # ("operation would make the legacy stream depend on a capturing
+            # blocking stream"). Detaching lets them be freed and re-created
+            # on the capture stream.
+            loss = loss.detach()
+            self._maybe_capture_graph(tau_height, tau_global)
 
         self.num_steps_done += 1
 
@@ -514,14 +676,13 @@ class FilamentOptimizer:
         global_logits = params["global_logits"]
         discrete_height_image = _discretize_height_only(effective_logits, h, max_layers)
 
-        num_layers = global_logits.shape[0]
-        discrete_global_vals = []
-        for j in range(num_layers):
-            p = deterministic_gumbel_softmax(
-                global_logits[j], tau_global, hard=True, rng_seed=rng_seed + j
-            )
-            discrete_global_vals.append(torch.argmax(p))
-        discrete_global = torch.stack(discrete_global_vals, dim=0)
+        # Vectorized equivalent of the former per-layer
+        # deterministic_gumbel_softmax + argmax loop (see
+        # batched_layer_material_indices): identical selection, one kernel
+        # instead of ~max_layers tiny ones.
+        discrete_global = batched_layer_material_indices(
+            global_logits, tau_global, rng_seed
+        )
         return discrete_global, discrete_height_image
 
     def log_to_tensorboard(
@@ -1113,6 +1274,10 @@ class FilamentOptimizer:
                     focus_map=self.focus_map,
                     alpha=self.alpha,
                     compute_dtype=self.composite_compute_dtype,
+                    # The only backward in the pipeline that runs at full
+                    # *output* resolution, so it sets the whole run's VRAM
+                    # high-water mark - use the layer-chunked composite.
+                    low_memory=True,
                 )
                 loss.backward()
                 ft_optimizer.step()

@@ -907,8 +907,16 @@ test.describe('Global Parameters Bar', () => {
     await expect(page.locator('[data-testid="global-background-height"]')).toHaveValue('0.24')
   })
 
-  test('base layers default is 6 (0.24mm background / 0.04mm layer height, read-only)', async ({ page }) => {
-    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveText('6')
+  test('base layers default is 6 (0.24mm background / 0.04mm layer height)', async ({ page }) => {
+    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('6')
+  })
+
+  test('base layers is editable and drives background height', async ({ page }) => {
+    const baseLayers = page.locator('[data-testid="global-base-layers"]')
+    await baseLayers.fill('12')
+    await baseLayers.dispatchEvent('change')
+    // 12 * 0.04mm default layer height = 0.48.
+    await expect(page.locator('[data-testid="global-background-height"]')).toHaveValue('0.48')
   })
 
   test('dimension (mm) default is 150', async ({ page }) => {
@@ -922,18 +930,19 @@ test.describe('Global Parameters Bar', () => {
 
   test('editing background height updates base layers, editing layer height also updates it', async ({ page }) => {
     // Background height (mm) is the field of record; base layers is a
-    // read-only derived display (background_height / layer_height).
+    // derived display (background_height / layer_height) that can also be
+    // edited directly (which writes back to background_height).
     const backgroundHeight = page.locator('[data-testid="global-background-height"]')
     await backgroundHeight.fill('0.4')
     await backgroundHeight.dispatchEvent('change')
     // 0.4 / 0.04mm default layer height = 10.
-    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveText('10')
+    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('10')
 
     const layerHeight = page.locator('[data-testid="global-layer-height"]')
     await layerHeight.fill('0.2')
     await layerHeight.dispatchEvent('change')
     // 0.4 / 0.2 = 2.
-    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveText('2')
+    await expect(page.locator('[data-testid="global-base-layers"]')).toHaveValue('2')
   })
 
   test('background height stays exact when only layer height changes', async ({ page }) => {

@@ -97,6 +97,7 @@ class PruningSettings(CamelCaseModel):
     pruning_max_colors: int = 100
     pruning_max_swaps: int = 100
     pruning_max_layer: int = 75
+    job_id: Optional[str] = None
 
 
 class StateSnapshot(CamelCaseModel):
@@ -108,6 +109,7 @@ class StateSnapshot(CamelCaseModel):
     input_image: Optional[str] = None
     current_job_id: Optional[str] = None
     optimization_result_id: Optional[str] = None
+    job_status: Optional[str] = None
 
 
 class ProjectState(CamelCaseModel):

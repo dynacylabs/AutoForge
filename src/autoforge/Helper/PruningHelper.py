@@ -9,16 +9,22 @@ import threading
 import numpy as np
 
 from autoforge.Helper.OptimizerHelper import (
+    batched_layer_material_indices,
     composite_image_disc,
     adaptive_round,
     bleed_layer_effect,
-    deterministic_rand_like,
+    deterministic_gumbel_noise,
 )
 from autoforge.Loss.LossFunctions import compute_loss
 from autoforge.Modules.Optimizer import FilamentOptimizer, _compute_height_offset_term
 
 # One global lock that serialises every call that needs GPU / VRAM
 _gpu_lock = threading.Lock()
+
+# How many layers to process per pass in the composite helpers below. Keeps
+# the [L,H,W] working set bounded without reintroducing meaningful per-layer
+# Python overhead - at max_layers=75 this is 3 passes.
+LAYER_CHUNK = 25
 
 
 def _eff_thick_from_logits(
@@ -39,12 +45,23 @@ def _eff_thick_from_logits(
     z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
     z_int = torch.round(z_disc).to(torch.int64)  # [H,W]
 
-    layer_idx = torch.arange(max_layers, device=device).view(-1, 1, 1)  # [L,1,1]
-    p_print = (layer_idx < z_int.unsqueeze(0)).to(eff_logits.dtype)      # [L,H,W]
-    p_bleed = bleed_layer_effect(p_print, 0.1)                           # [L,H,W]
-    del p_print
-    eff = torch.clamp(p_bleed, 0.0, 1.0) * h                             # [L,H,W]
-    del p_bleed
+    # Filled a chunk at a time: the one-shot version had p_print, the blurred
+    # copy and the result all live at once (3 x [L,H,W]), and only the result
+    # is actually needed by the caller.
+    eff = torch.empty(
+        (max_layers, z_int.shape[0], z_int.shape[1]),
+        dtype=eff_logits.dtype,
+        device=device,
+    )
+    for start in range(0, max_layers, LAYER_CHUNK):
+        stop = min(start + LAYER_CHUNK, max_layers)
+        layer_idx = torch.arange(start, stop, device=device).view(-1, 1, 1)
+        p_print = (layer_idx < z_int.unsqueeze(0)).to(eff_logits.dtype)   # [k,H,W]
+        p_bleed = bleed_layer_effect(p_print, 0.1)
+        del p_print
+        torch.clamp(p_bleed, 0.0, 1.0, out=eff[start:stop])
+        eff[start:stop] *= h
+        del p_bleed
     return eff
 
 
@@ -93,14 +110,36 @@ def _compose_candidate(
     comp = torch.zeros(H, W, 3, device=device, dtype=torch.float32)
     remain = torch.ones(H, W, device=device, dtype=torch.float32)
 
-    for l in range(L - 1, -1, -1):  # top → bottom
-        ratio = eff_thick[l] / material_TDs[l]                            # [H,W]
-        opac = _opacity_from_ratio(ratio)                                 # [H,W]
+    # Walk the stack top-to-bottom in chunks of layers. Two reasons for the
+    # chunking rather than one [L,H,W] pass:
+    #  * VRAM. The one-shot version needed ~7 live [L,H,W] tensors (ratio,
+    #    opacity, its flip, transmittance, the shifted copy, the cumulative
+    #    product and the weights) - about 130MB at full output resolution
+    #    with L=75 - which made the pruning phases the pipeline's high-water
+    #    mark once fine_tune_height_offsets was brought down.
+    #  * It costs nothing. At LAYER_CHUNK=25 this is 3 Python iterations, not
+    #    the 75 the original per-layer loop ran (that loop's 69,760 calls to
+    #    _opacity_from_ratio were 4.3s of a 15.3s post-optimize phase).
+    hi = L
+    while hi > 0:
+        lo = max(0, hi - LAYER_CHUNK)
+        # Reverse each slice so the chunk is ordered top-to-bottom, matching
+        # the direction the transmittance accumulates in.
+        eff_c = eff_thick[lo:hi].flip(0)                                   # [k,H,W]
+        opac = _opacity_from_ratio(eff_c / material_TDs[lo:hi].flip(0).view(-1, 1, 1))
+        del eff_c
+        trans = 1.0 - opac
+        rem_local = torch.cumprod(
+            torch.cat([torch.ones_like(trans[:1]), trans[:-1]], dim=0), dim=0
+        )                                                                 # [k,H,W]
+        comp = comp + remain.unsqueeze(-1) * torch.einsum(
+            "lhw,lc->hwc", rem_local * opac, material_colors[lo:hi].flip(0)
+        )
+        remain = remain * (rem_local[-1] * trans[-1])
+        del opac, trans, rem_local
+        hi = lo
 
-        comp += remain.unsqueeze(-1) * opac.unsqueeze(-1) * material_colors[l].view(1, 1, 3)
-        remain *= (1.0 - opac)
-
-    comp += remain.unsqueeze(-1) * background
+    comp = comp + remain.unsqueeze(-1) * background
     return comp * 255.0
 
 
@@ -123,18 +162,11 @@ def material_select_from_logits(
 
     Returns (layer_colors [L,3], layer_TDs [L]).
     """
-    L, M = global_logits.shape
-    cols = torch.empty(L, 3, device=global_logits.device, dtype=material_colors.dtype)
-    tds = torch.empty(L, device=global_logits.device, dtype=material_TDs.dtype)
-
-    for j in range(L):
-        noise = deterministic_rand_like(global_logits[j], rng_seed + j)
-        g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)
-        y = torch.softmax((global_logits[j] + g) / tau, dim=-1)
-        idx = y.argmax()
-        cols[j] = material_colors[idx]
-        tds[j] = material_TDs[idx].clamp(1e-8, 1e8)
-
+    # Vectorized over layers (see batched_layer_material_indices): identical
+    # selection, one kernel instead of L tiny ones.
+    sel = batched_layer_material_indices(global_logits, tau, rng_seed)  # [L]
+    cols = material_colors.index_select(0, sel)  # [L,3]
+    tds = material_TDs.index_select(0, sel).clamp(1e-8, 1e8)  # [L]
     return cols, tds
 
 
@@ -147,19 +179,15 @@ def _material_select_batched(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched material selection [B, L, M] → ([B, L, 3], [B, L])."""
     B, L, M = global_logits_b.shape
-    cols = torch.empty(B, L, 3, device=global_logits_b.device, dtype=material_colors.dtype)
-    tds = torch.empty(B, L, device=global_logits_b.device, dtype=material_TDs.dtype)
-
-    for j in range(L):
-        gl_j = global_logits_b[:, j, :]                                  # [B, M]
-        noise = deterministic_rand_like(global_logits_b[0, j], rng_seed + j)
-        g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)
-        g_b = g.unsqueeze(0).expand(B, -1)                                # [B, M]
-        y = torch.softmax((gl_j + g_b) / tau, dim=-1)                     # [B, M]
-        idx = y.argmax(dim=-1)                                            # [B]
-        cols[:, j] = material_colors[idx]
-        tds[:, j] = material_TDs[idx].clamp(1e-8, 1e8)
-
+    # One noise draw per layer, shared across the batch - vectorized over
+    # layers instead of looped (identical values, see
+    # deterministic_gumbel_noise).
+    seeds = torch.arange(L, dtype=torch.int64, device=global_logits_b.device) + rng_seed
+    g = deterministic_gumbel_noise(seeds, M)                              # [L, M]
+    y = torch.softmax((global_logits_b + g.unsqueeze(0)) / tau, dim=-1)   # [B, L, M]
+    idx = y.argmax(dim=-1)                                                # [B, L]
+    cols = material_colors[idx]                                           # [B, L, 3]
+    tds = material_TDs[idx].clamp(1e-8, 1e8)                              # [B, L]
     return cols, tds
 
 
@@ -183,22 +211,29 @@ def _material_select_batched_seeds(
     L, M = global_logits.shape
     B = seeds.shape[0]
     device = global_logits.device
-    cols = torch.empty(B, L, 3, device=device, dtype=material_colors.dtype)
-    tds = torch.empty(B, L, device=device, dtype=material_TDs.dtype)
 
+    # deterministic_rand_like's formula, vectorized over *both* the batch of
+    # seeds and the layers (was a Python loop over layers):
+    # indices[b, j, m] = m + seeds[b] + j
+    #
+    # Deliberately written out in eager ops rather than reusing the
+    # @torch.jit.script `deterministic_gumbel_noise` helper: TorchScript's
+    # profiling executor re-optimizes a scripted graph after a couple of
+    # calls and the optimized form is *not* bit-identical to the eager
+    # arithmetic (verified: same inputs, results differ in the last ulp,
+    # which flips this function's argmax on ~97% of random [L,M] logits).
+    # This function's original was eager, so staying eager keeps its chosen
+    # seeds bit-identical to the pre-change pipeline.
     m_idx = torch.arange(M, device=device, dtype=torch.float32)  # [M]
-    for j in range(L):
-        # deterministic_rand_like's formula, vectorized over the batch of
-        # seeds instead of called once per seed: indices[b, m] = m + seeds[b] + j
-        indices = m_idx.unsqueeze(0) + (seeds + j).to(torch.float32).unsqueeze(1)  # [B, M]
-        r = torch.sin(indices) * 43758.5453123
-        noise = r - torch.floor(r)
-        g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)  # [B, M]
-        y = torch.softmax((global_logits[j].unsqueeze(0) + g) / tau, dim=-1)  # [B, M]
-        idx = y.argmax(dim=-1)  # [B]
-        cols[:, j] = material_colors[idx]
-        tds[:, j] = material_TDs[idx].clamp(1e-8, 1e8)
-
+    all_seeds = seeds.view(B, 1) + torch.arange(L, dtype=torch.int64, device=device).view(1, L)
+    indices = m_idx.view(1, 1, M) + all_seeds.to(torch.float32).unsqueeze(-1)  # [B,L,M]
+    r = torch.sin(indices) * 43758.5453123
+    noise = r - torch.floor(r)
+    g = -torch.log(-torch.log(noise + 1e-20) + 1e-20)  # [B, L, M]
+    y = torch.softmax((global_logits.unsqueeze(0) + g) / tau, dim=-1)  # [B, L, M]
+    idx = y.argmax(dim=-1)  # [B, L]
+    cols = material_colors[idx]                    # [B, L, 3]
+    tds = material_TDs[idx].clamp(1e-8, 1e8)       # [B, L]
     return cols, tds
 
 

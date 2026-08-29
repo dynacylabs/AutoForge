@@ -3,7 +3,7 @@ import { useAppStore } from '../store/appStore'
 import { Box, Loader2, AlertTriangle } from 'lucide-react'
 import { ThreeDView } from './ThreeDView'
 import { ResultsHistory } from './ResultsHistory'
-import { getStackHandles, getStackSegments } from '../lib/colorStack'
+import { getStackHandles, getStackSegments, filterActiveHandles } from '../lib/colorStack'
 
 export const Preview3DPanel: React.FC = () => {
   const previewImage = useAppStore((s) => s.previewImage)
@@ -14,7 +14,6 @@ export const Preview3DPanel: React.FC = () => {
   const setPreviewImage = useAppStore((s) => s.setPreviewImage)
   const setInitState = useAppStore((s) => s.setInitState)
   const currentJob = useAppStore((s) => s.currentJob)
-  const setCurrentJob = useAppStore((s) => s.setCurrentJob)
   const previewVersion = useAppStore((s) => s.previewVersion)
   const bumpPreviewVersion = useAppStore((s) => s.bumpPreviewVersion)
   const wsRef = useRef<WebSocket | null>(null)
@@ -34,12 +33,13 @@ export const Preview3DPanel: React.FC = () => {
   const hasAssignedSliderColor = colorSliders.some((s) => s.enabled && s.layer > 0 && s.filament_uuid)
   const stackSegments = useMemo(() => {
     if (!hasAssignedSliderColor) return []
-    const handles = getStackHandles(colorSliders, filaments)
+    const handles = filterActiveHandles(getStackHandles(colorSliders, filaments))
     return getStackSegments(handles)
   }, [colorSliders, filaments, hasAssignedSliderColor])
 
   const optimizationStarted = currentJob && ['running', 'paused', 'pending'].includes(currentJob.status)
   const jobFailed = currentJob && currentJob.status === 'failed'
+  const jobHasResult = currentJob?.status === 'completed'
   const jobError = currentJob?.error
 
   useEffect(() => {
@@ -113,11 +113,20 @@ export const Preview3DPanel: React.FC = () => {
     }
   }, [setPreviewImage, setSliders, bumpPreviewVersion])
 
-  // Always poll init status when we have an image
+  // Poll init status when we have an image, but only up through the
+  // pre-run "init preview" phase. Once a real optimization result exists,
+  // this must stop entirely: `/api/sliders/from-optimizer` always returns
+  // the stack derived from the stored (unedited) solution, never the
+  // user's live slider edits, so leaving this interval running after
+  // completion re-applied that stale stack over the user's edits every
+  // second — the color sliders / color core "snapping back" a moment
+  // after every drag, independent of (and in addition to) any network
+  // race on the edit itself.
   useEffect(() => {
     if (!inputImage) return
     if (optimizationStarted) return
     if (jobFailed) return
+    if (jobHasResult) return
 
     let cancelled = false
 
@@ -164,25 +173,13 @@ export const Preview3DPanel: React.FC = () => {
       cancelled = true
       clearInterval(interval)
     }
-    }, [inputImage, setPreviewImage, setInitState, updateSlider, optimizationStarted])
+    }, [inputImage, setPreviewImage, setInitState, updateSlider, optimizationStarted, jobFailed, jobHasResult])
 
   const coloredPlyUrl = stlFile && currentJob?.job_id
     ? `/api/outputs/colored-ply/${currentJob.job_id}?v=${previewVersion}`
     : null
 
   const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage
-
-  const handleSelectHistoryResult = async (jobId: string) => {
-    try {
-      const res = await fetch(`/api/optimize/status/${jobId}`)
-      if (!res.ok) return
-      const job = await res.json()
-      setCurrentJob(job)
-      bumpPreviewVersion()
-    } catch {
-      // ignore
-    }
-  }
 
   return (
     <div className="flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden">
@@ -192,7 +189,7 @@ export const Preview3DPanel: React.FC = () => {
           3D Preview
         </h3>
       </div>
-      <div className="flex-1 relative">
+      <div className="flex-1 relative overflow-hidden">
         {stlFile ? (
           <div data-testid="three-d-view" className="w-full h-full">
             <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
@@ -201,7 +198,7 @@ export const Preview3DPanel: React.FC = () => {
           <img
             src={previewImage}
             alt="Preview"
-            className="w-full h-full object-contain"
+            className="absolute inset-0 w-full h-full object-contain"
             data-testid="preview-image"
           />
         ) : jobFailed ? (
@@ -218,7 +215,7 @@ export const Preview3DPanel: React.FC = () => {
           <img
             src={previewImage}
             alt="Preview"
-            className="w-full h-full object-contain"
+            className="absolute inset-0 w-full h-full object-contain"
             data-testid="preview-image"
           />
         ) : initState.status === 'initializing' ? (
@@ -242,7 +239,7 @@ export const Preview3DPanel: React.FC = () => {
           </div>
         )}
         <div style={{ position: 'absolute', bottom: 8, right: 8, zIndex: 10 }} data-testid="results-history-anchor">
-          <ResultsHistory onSelect={handleSelectHistoryResult} />
+          <ResultsHistory />
         </div>
       </div>
     </div>

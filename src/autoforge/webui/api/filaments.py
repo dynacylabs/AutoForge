@@ -63,32 +63,40 @@ def list_filament_brands():
 
 
 @router.post("/import-csv")
-async def import_csv(body: dict | None = None, contents: str | None = None):
-    """Accepts JSON body with a `contents` string key, or a `contents` query param."""
+async def import_csv(body: dict | None = None, contents: str | None = None, mode: str = "merge"):
+    """Accepts JSON body with a `contents` string key (and optional `mode`:
+    "merge" (default, overwrites same brand+name entries in place) or
+    "replace" (wipes the library first)), or `contents`/`mode` query params.
+    """
     svc = get_filament_service()
     if contents is not None:
         pass
     elif body is not None and isinstance(body, dict):
         contents = body.get("contents", "")
+        mode = body.get("mode", mode)
     else:
         raise HTTPException(400, "Missing 'contents' (send as JSON body or query param)")
     if not contents:
         raise HTTPException(400, "Empty contents")
-    result = svc.import_csv(contents)
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be 'merge' or 'replace'")
+    result = svc.import_csv(contents, mode=mode)
     return {
         "status": "ok",
-        "message": f"Imported {len(result)} filaments",
+        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
         "count": len(result),
     }
 
 
 @router.post("/import-json")
-async def import_json(data: list[dict]):
+async def import_json(data: list[dict], mode: str = "merge"):
     svc = get_filament_service()
-    result = svc.import_json(data)
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be 'merge' or 'replace'")
+    result = svc.import_json(data, mode=mode)
     return {
         "status": "ok",
-        "message": f"Imported {len(result)} filaments",
+        "message": f"Imported {len(result)} filaments" + (" (library replaced)" if mode == "replace" else ""),
         "count": len(result),
     }
 

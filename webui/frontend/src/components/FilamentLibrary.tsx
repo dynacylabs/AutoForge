@@ -1,10 +1,11 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
 import { useFilamentLoader } from '../services/filamentService'
-import { ChevronDown, ChevronRight, Plus, Save, Search, FolderOpen, Upload, Eye, EyeOff } from 'lucide-react'
+import { ChevronDown, ChevronRight, Plus, Save, Upload } from 'lucide-react'
 import type { Filament } from '../types'
 import { ActiveFilamentsPanel } from './ActiveFilamentsPanel'
 import { FilamentSwatch } from './FilamentSwatch'
+import { EditFilamentModal } from './EditFilamentModal'
 
 interface BrandGroup {
   name: string
@@ -22,9 +23,7 @@ export const FilamentLibrary: React.FC = () => {
   const setSettingsModalOpen = useAppStore((s) => s.setSettingsModalOpen)
   const setNewFilamentModalOpen = useAppStore((s) => s.setNewFilamentModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
-  const showDefaultLibrary = useAppStore((s) => s.showDefaultLibrary)
   const customLibraryLoaded = useAppStore((s) => s.customLibraryLoaded)
-  const setShowDefaultLibrary = useAppStore((s) => s.setShowDefaultLibrary)
   const setCustomLibraryLoaded = useAppStore((s) => s.setCustomLibraryLoaded)
 
   useFilamentLoader()
@@ -43,12 +42,11 @@ export const FilamentLibrary: React.FC = () => {
   const activeUuids = React.useMemo(() => new Set(activeFilaments.map((f) => f.uuid)), [activeFilaments])
 
   const userFilaments = React.useMemo(() => filaments.filter((f) => f.source === 'user'), [filaments])
-  const swatchFilaments = React.useMemo(() => filaments.filter((f) => f.source === 'swatch'), [filaments])
 
   const displayFilaments = React.useMemo(() => {
     if (!customLibraryLoaded) return userFilaments
-    return showDefaultLibrary ? filaments : userFilaments
-  }, [filaments, userFilaments, swatchFilaments, customLibraryLoaded, showDefaultLibrary])
+    return filaments
+  }, [filaments, userFilaments, customLibraryLoaded])
 
   const filteredFilaments = React.useMemo(() => {
     if (!filterQuery) return displayFilaments
@@ -96,16 +94,6 @@ export const FilamentLibrary: React.FC = () => {
       <div className="p-3 border-b border-gray-700">
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold text-gray-200">Filament Library</h2>
-          {customLibraryLoaded && (
-            <button
-              onClick={() => setShowDefaultLibrary(!showDefaultLibrary)}
-              className="text-gray-400 hover:text-gray-200"
-              title={showDefaultLibrary ? 'Hide default library' : 'Show default library'}
-              data-testid="toggle-default-library"
-            >
-              {showDefaultLibrary ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-            </button>
-          )}
         </div>
 
         {/* Tabs */}
@@ -140,6 +128,8 @@ export const FilamentLibrary: React.FC = () => {
           </div>
         )}
       </div>
+
+      <EditFilamentModal />
 
       {/* Bottom controls */}
       <div style={{ padding: 8, borderTop: '1px solid var(--border)', marginTop: 'auto' }}>
@@ -222,6 +212,8 @@ const BrandFolder: React.FC<{ group: BrandGroup; activeUuids: Set<string> }> = (
 const FilamentItem: React.FC<{ filament: Filament; isActive: boolean }> = ({ filament, isActive }) => {
   const addActiveFilament = useAppStore((s) => s.addActiveFilament)
   const removeActiveFilament = useAppStore((s) => s.removeActiveFilament)
+  const setEditingFilament = useAppStore((s) => s.setEditingFilament)
+  const setEditFilamentModalOpen = useAppStore((s) => s.setEditFilamentModalOpen)
 
   const handleDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData('application/json', JSON.stringify(filament))
@@ -237,12 +229,19 @@ const FilamentItem: React.FC<{ filament: Filament; isActive: boolean }> = ({ fil
     }
   }
 
+  const handleDoubleClick = () => {
+    setEditingFilament(filament)
+    setEditFilamentModalOpen(true)
+  }
+
   return (
     <div
       draggable
       onDragStart={handleDragStart}
+      onDoubleClick={handleDoubleClick}
       className="flex items-center gap-1.5 px-2 py-1 text-xs hover:bg-gray-800 cursor-grab active:cursor-grabbing"
       data-testid={`filament-${filament.uuid}`}
+      title="Double-click to edit"
     >
       {/* +/- button on the left */}
       <button

@@ -97,7 +97,23 @@ export function useFilamentLoader() {
     load()
   }, [])
 
+  // Fires on every activeTab/filterBrand/filterQuery change to refetch with
+  // the new filters — but those deps also "change" (from undefined to their
+  // initial values) on the very first render, which duplicated `load()`'s
+  // own loadFilaments()/loadFilamentBrands() calls above with an identical,
+  // redundant pair of requests racing them for the same connections. A page
+  // load already fires a dozen-plus requests inside its first second (every
+  // panel's own on-mount fetch, the project/filament/history loads, the
+  // preview WebSocket handshake); HTTP/1.1 caps a browser at 6 concurrent
+  // connections per origin, so any request issued shortly after — e.g. a
+  // user importing a filament file right away — could queue for seconds
+  // behind this avoidable overflow instead of running immediately.
+  const isFirstFilterEffect = useRef(true)
   useEffect(() => {
+    if (isFirstFilterEffect.current) {
+      isFirstFilterEffect.current = false
+      return
+    }
     loadFilaments()
     loadFilamentBrands()
   }, [activeTab, filterBrand, filterQuery])

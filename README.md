@@ -41,9 +41,33 @@ The pruning is set to a maximum of 8 color and 20 swaps, so each image uses at m
 - **Live Visualization**: (Optional) Displays live composite images during the optimization process.
 - **Hueforge export**: Outputs a project file that can be opened with hueforge.
 
-## Manual Installation
+## Web UI: One-Click Install & Run
 
-To install AutoForge, simply install the current version from PyPI:
+The easiest way to use AutoForge is the web UI — a local app (like ComfyUI) with drag-and-drop image upload, a filament library, live sliders for adjusting colors after optimization, and pruning. No command-line arguments needed.
+
+1. **Clone this repository** (or download and extract the ZIP from the green "Code" button on GitHub).
+2. **Install**, from the project folder:
+   - Linux/macOS: `./install.sh`
+   - Windows: double-click `install.bat` (or run it from a terminal)
+
+   This installs [`uv`](https://docs.astral.sh/uv/) (a fast Python package manager) if you don't already have it, installs all Python dependencies, and builds the web UI. You'll need [Node.js](https://nodejs.org/) installed for that last step — the installer will tell you if it's missing.
+3. **Run**:
+   - Linux/macOS: `./run_webui.sh`
+   - Windows: double-click `run_webui.bat`
+
+   This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
+4. **Update to the latest release** whenever you want, from the project folder:
+   - Linux/macOS: `./update.sh`
+   - Windows: double-click `update.bat`
+
+   This checks GitHub for a newer release and, if one exists, pulls it and reinstalls dependencies for you. Add `--check` to only check without applying it (e.g. `./update.sh --check`).
+
+If you have problems running the code on your GPU, please refer to the [Pytorch Homepage](https://pytorch.org/) for help. \
+CUDA, ROCm, and MPS (Apple Metal) are supported, but you need to install the correct version of pytorch for your system — `install.sh`/`install.bat` install whatever `uv sync` resolves by default, so swap in a GPU-specific PyTorch build afterwards if you need one.
+
+## Manual Installation (CLI only)
+
+If you just want the command-line tool (no web UI), install the current version from PyPI:
 ```bash
    pip install -U autoforge
 ```

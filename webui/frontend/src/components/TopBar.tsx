@@ -1,11 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '../store/appStore'
-import { Settings, Play, Pause, Square, Loader2, Scissors } from 'lucide-react'
+import { Settings, Play, Pause, Square, Loader2, Scissors, Sun, Moon, ArrowUpCircle } from 'lucide-react'
 import { PruningModal } from './PruningModal'
+import { FileMenu } from './FileMenu'
 import { createProgressTracker, formatDuration, type ProgressTracker } from '../lib/progress'
+
+interface UpdateInfo {
+  current_version: string
+  latest_version: string | null
+  update_available: boolean
+  release_url: string
+}
 
 export const TopBar: React.FC = () => {
   const setSettingsModalOpen = useAppStore((s) => s.setSettingsModalOpen)
+  const theme = useAppStore((s) => s.theme)
+  const toggleTheme = useAppStore((s) => s.toggleTheme)
   const currentJob = useAppStore((s) => s.currentJob)
   const startOptimization = useAppStore((s) => s.startOptimization)
   const pauseOptimization = useAppStore((s) => s.pauseOptimization)
@@ -16,9 +26,40 @@ export const TopBar: React.FC = () => {
   const pausePruning = useAppStore((s) => s.pausePruning)
   const resumePruning = useAppStore((s) => s.resumePruning)
   const cancelPruning = useAppStore((s) => s.cancelPruning)
+  const activeFilaments = useAppStore((s) => s.activeFilaments)
+  const inputImage = useAppStore((s) => s.inputImage)
 
   const trackerRef = useRef<ProgressTracker | null>(null)
   const [elapsedEta, setElapsedEta] = useState<{ elapsed: number; eta: number; stalled: boolean } | null>(null)
+  const [startError, setStartError] = useState<string | null>(null)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+
+  useEffect(() => {
+    // Deliberately delayed: this is pure background/non-urgent work, but
+    // firing it immediately would be one more request competing for a
+    // browser's ~6 concurrent per-origin HTTP/1.1 connections during the
+    // page's already-busy first second of mount (every panel's own
+    // on-mount fetch, project/filament/history loads, the preview
+    // WebSocket handshake) — pushing it out lets that initial burst drain
+    // first instead of queuing behind it.
+    const timer = setTimeout(() => {
+      fetch('/api/system/update-check')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => { if (data?.update_available) setUpdateInfo(data) })
+        .catch(() => {})
+    }, 4000)
+    return () => clearTimeout(timer)
+  }, [])
+
+  const hasResult = currentJob?.status === 'completed'
+  const canRun = activeFilaments.length > 0 && !!inputImage
+  const runDisabledReason = !inputImage
+    ? 'Upload an input image first'
+    : activeFilaments.length === 0
+      ? 'Add at least one active filament first'
+      : ''
+  const canPrune = hasResult
+  const pruneDisabledReason = canPrune ? '' : 'Run an optimization first'
 
   const jobId = currentJob?.job_id
   const isActive = currentJob?.status === 'running' || currentJob?.status === 'paused'
@@ -42,6 +83,11 @@ export const TopBar: React.FC = () => {
   }, [isActive, jobId, currentJob])
 
   const handleStart = async () => {
+    setStartError(null)
+    if (currentJob?.status !== 'paused' && !canRun) {
+      setStartError(runDisabledReason)
+      return
+    }
     try {
       if (currentJob?.status === 'paused') {
         await resumeOptimization(currentJob.job_id)
@@ -50,6 +96,7 @@ export const TopBar: React.FC = () => {
       }
     } catch (e) {
       console.error('Failed to start:', e)
+      setStartError(e instanceof Error ? e.message : 'Failed to start optimization')
     }
   }
 
@@ -100,6 +147,7 @@ export const TopBar: React.FC = () => {
       <div className="flex items-center gap-3">
         <h1 className="text-sm font-bold text-gray-100">AutoForge</h1>
         <span className="text-xs text-gray-500">v1.9.4</span>
+        <FileMenu />
       </div>
 
       <div className="flex items-center gap-2">
@@ -240,12 +288,26 @@ export const TopBar: React.FC = () => {
         ) : (
           <button
             onClick={handleStart}
-            className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs text-white disabled:opacity-50"
+            disabled={!canRun}
+            title={canRun ? undefined : runDisabledReason}
+            className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs text-white disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
             data-testid="top-start-btn"
           >
             <Play className="w-3 h-3" />
             Run
           </button>
+        )}
+
+        {startError ? (
+          <span className="text-xs text-red-400" data-testid="start-error">
+            {startError}
+          </span>
+        ) : (
+          currentJob?.status !== 'paused' && !canRun && (
+            <span className="text-xs text-gray-500" data-testid="run-disabled-reason">
+              {runDisabledReason}
+            </span>
+          )
         )}
 
         {(currentJob?.status === 'running' || currentJob?.status === 'paused') && (
@@ -261,11 +323,36 @@ export const TopBar: React.FC = () => {
 
         <button
           onClick={() => setPruningModalOpen(true)}
-          className="flex items-center gap-1 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-xs text-white"
+          disabled={!canPrune}
+          title={canPrune ? undefined : pruneDisabledReason}
+          className="flex items-center gap-1 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-xs text-white disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-purple-600"
           data-testid="top-pruning-btn"
         >
           <Scissors className="w-3 h-3" />
           Pruning
+        </button>
+
+        {updateInfo && (
+          <a
+            href={updateInfo.release_url}
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center gap-1 px-2 py-1.5 text-xs text-green-400 hover:text-green-300 hover:bg-gray-800 rounded"
+            title={`AutoForge ${updateInfo.latest_version} is available (current: ${updateInfo.current_version})`}
+            data-testid="update-available-badge"
+          >
+            <ArrowUpCircle className="w-3.5 h-3.5" />
+            Update available
+          </a>
+        )}
+
+        <button
+          onClick={toggleTheme}
+          className="p-1.5 text-gray-400 hover:text-gray-200 hover:bg-gray-700 rounded"
+          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          data-testid="theme-toggle-btn"
+        >
+          {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
         </button>
 
         <button

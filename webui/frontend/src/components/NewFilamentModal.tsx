@@ -78,7 +78,7 @@ export const NewFilamentModal: React.FC = () => {
             New Filament
           </DialogTitle>
           <DialogDescription className="sr-only">
-            Create a new filament with a brand, name, type, transmissivity, and color.
+            Create a new filament with a brand, name, type, transmission distance, and color.
           </DialogDescription>
           <button
             onClick={() => setNewFilamentModalOpen(false)}
@@ -131,7 +131,7 @@ export const NewFilamentModal: React.FC = () => {
               </select>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-xs text-gray-400">Transmissivity (TD)</label>
+              <label className="text-xs text-gray-400">Transmission Distance (TD)</label>
               <input
                 type="number"
                 value={td}

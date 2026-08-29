@@ -134,6 +134,25 @@ class OptimizationService:
             jobs = sorted(self._results.values(), key=lambda j: j.started_at or "", reverse=True)
         return jobs
 
+    def get_latest_job(self) -> JobStatus | None:
+        """The most recently started *optimization* job, whatever its
+        status — used to restore the frontend to where it was after a page
+        reload (an in-progress job reconnects its WS, a completed one gets
+        its 3D result back), since `_jobs` (unlike `_results`) also holds
+        jobs that haven't reached a terminal state yet.
+
+        Excludes pruning jobs (`prune-*`): those are a secondary tracking
+        entry for progress only — pruning writes its output into the
+        *original* optimization job's directory, not its own — so treating
+        one as "the current job" would point the UI at a job_id with no
+        real output directory.
+        """
+        with self._lock:
+            candidates = [j for j in self._jobs.values() if not j.job_id.startswith("prune-")]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda j: j.started_at or "")
+
     def cancel_event(self, job_id: str) -> threading.Event | None:
         with self._lock:
             return self._cancel_events.get(job_id)

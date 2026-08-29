@@ -15,6 +15,7 @@ import { useJobWebSocket } from './hooks/useJobWebSocket'
 const App: React.FC = () => {
   const loadProjectState = useAppStore((s) => s.loadProjectState)
   const loadActiveFilaments = useAppStore((s) => s.loadActiveFilaments)
+  const loadCurrentJob = useAppStore((s) => s.loadCurrentJob)
   const currentJob = useAppStore((s) => s.currentJob)
   const colorSliders = useAppStore((s) => s.colorSliders)
   const sliderLayerRange = useAppStore((s) => s.sliderLayerRange)
@@ -36,6 +37,7 @@ const App: React.FC = () => {
         try {
           await loadProjectState()
           await loadActiveFilaments()
+          await loadCurrentJob()
           // If the responses succeeded, we're done
           break
         } catch {
@@ -45,7 +47,7 @@ const App: React.FC = () => {
       }
     }
     loadInitial()
-  }, [loadProjectState, loadActiveFilaments])
+  }, [loadProjectState, loadActiveFilaments, loadCurrentJob])
 
   // Keyboard shortcuts for undo/redo
   useEffect(() => {
@@ -88,7 +90,7 @@ const App: React.FC = () => {
             Mesh Height: {currentMeshHeight.toFixed(2)}/{totalMeshHeight.toFixed(2)}mm
           </div>
 
-          <div style={{ height: 178, flexShrink: 0, minWidth: 0, overflow: 'hidden', borderTop: '1px solid var(--border)' }}>
+          <div style={{ height: 223, flexShrink: 0, minWidth: 0, overflow: 'hidden', borderTop: '1px solid var(--border)' }}>
             <ColorSliders />
           </div>
         </main>

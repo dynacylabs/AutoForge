@@ -5,15 +5,62 @@ import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, Proj
 const UNDO_STACK: Snapshot[] = []
 let UNDO_INDEX = -1
 
+export interface HistoryEntry {
+  timestamp: number
+  label: string
+  jobId: string | null
+  jobStatus: string | null
+}
+
+function snapshotToHistoryEntry(s: Snapshot): HistoryEntry {
+  return {
+    timestamp: s.timestamp,
+    label: s.label || 'State change',
+    jobId: s.currentJobId ?? null,
+    jobStatus: s.jobStatus ?? null,
+  }
+}
+
 let pruningPollTimer: ReturnType<typeof setTimeout> | null = null
 
+// 10 columns before anything has been run — 4 pre-populated (so a first-time
+// user sees something to drag filaments onto) plus 6 empty slots to grow
+// into, rather than the full ~15-40 columns a real optimizer/pruner result
+// can produce. Once a job actually completes, `applySliders` replaces this
+// wholesale with however many bands the result really has.
 const defaultSliders: ColorSliderConfig[] = [
   { td: 2.0, layer: 8, depth_mm: 0.72, filament_uuid: '', enabled: true },
   { td: 3.0, layer: 13, depth_mm: 1.12, filament_uuid: '', enabled: true },
   { td: 8.0, layer: 20, depth_mm: 1.68, filament_uuid: '', enabled: true },
   { td: 5.0, layer: 27, depth_mm: 2.24, filament_uuid: '', enabled: true },
-  ...Array.from({ length: 11 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
+  ...Array.from({ length: 6 }, () => ({ td: 5.0, layer: 0, depth_mm: 0.0, filament_uuid: '', enabled: false })),
 ]
+
+const THEME_STORAGE_KEY = 'autoforge-theme'
+
+function readStoredTheme(): 'dark' | 'light' {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY)
+    if (stored === 'light' || stored === 'dark') return stored
+  } catch (_) {
+    // localStorage unavailable (private browsing, etc.) — fall back to dark
+  }
+  return 'dark'
+}
+
+function applyTheme(theme: 'dark' | 'light') {
+  document.documentElement.setAttribute('data-theme', theme)
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, theme)
+  } catch (_) {
+    // Ignore — theme just won't persist across reloads
+  }
+}
+
+// Applied immediately at module load (before the first render) so there's
+// no flash of the wrong theme while the store initializes.
+const initialTheme = readStoredTheme()
+applyTheme(initialTheme)
 
 const defaultSettings: OptimizationSettings = {
   input_image: '',
@@ -91,8 +138,10 @@ interface AppState {
   hasRenderedInitPreview: boolean
   newFilamentModalOpen: boolean
   importModalOpen: boolean
-  showDefaultLibrary: boolean
   customLibraryLoaded: boolean
+  editFilamentModalOpen: boolean
+  editingFilament: Filament | null
+  theme: 'dark' | 'light'
 
   setFilaments: (filaments: Filament[]) => void
   setFilamentTypes: (types: string[]) => void
@@ -121,8 +170,10 @@ interface AppState {
   setHasRenderedInitPreview: (val: boolean) => void
   setNewFilamentModalOpen: (open: boolean) => void
   setImportModalOpen: (open: boolean) => void
-  setShowDefaultLibrary: (show: boolean) => void
   setCustomLibraryLoaded: (loaded: boolean) => void
+  setEditFilamentModalOpen: (open: boolean) => void
+  setEditingFilament: (filament: Filament | null) => void
+  toggleTheme: () => void
   startOptimization: () => Promise<string>
   pauseOptimization: (jobId: string) => Promise<void>
   resumeOptimization: (jobId: string) => Promise<void>
@@ -134,13 +185,17 @@ interface AppState {
   runInit: () => Promise<void>
   loadProjectState: () => Promise<void>
   loadActiveFilaments: () => Promise<void>
+  loadCurrentJob: () => Promise<void>
+  loadProjectFromFile: (data: unknown) => Promise<void>
 
   // Undo/redo
   historyLength: number
   historyIndex: number
+  historyEntries: HistoryEntry[]
   undo: () => Promise<void>
   redo: () => Promise<void>
-  captureSnapshot: () => void
+  restoreToIndex: (index: number) => Promise<void>
+  captureSnapshot: (label?: string) => void
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -168,16 +223,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   hasRenderedInitPreview: false,
   newFilamentModalOpen: false,
   importModalOpen: false,
-  showDefaultLibrary: false,
   customLibraryLoaded: false,
+  editFilamentModalOpen: false,
+  editingFilament: null,
+  theme: initialTheme,
   historyLength: 0,
   historyIndex: -1,
+  historyEntries: [],
 
-  setFilaments: (filaments) => { set({ filaments }); queueCaptureSnapshot() },
+  setFilaments: (filaments) => { set({ filaments }); queueCaptureSnapshot('Filament library updated') },
   setFilamentTypes: (types) => set({ filamentTypes: types }),
   setFilamentBrands: (brands) => set({ filamentBrands: brands }),
-  setActiveFilaments: (filaments) => { set({ activeFilaments: filaments }); queueCaptureSnapshot() },
-  setSliders: (sliders) => { set({ colorSliders: sliders }); queueCaptureSnapshot() },
+  setActiveFilaments: (filaments) => { set({ activeFilaments: filaments }); queueCaptureSnapshot('Active filaments changed') },
+  setSliders: (sliders) => { set({ colorSliders: sliders }); queueCaptureSnapshot('Color slider edit') },
   applySliders: (sliders, range) => {
     set((state) => {
       // The optimizer/pruner can legitimately produce more or fewer bands
@@ -195,7 +253,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           : {}),
       }
     })
-    queueCaptureSnapshot()
+    queueCaptureSnapshot('Color slider edit')
   },
   addActiveFilament: async (filament) => {
     set((state) => {
@@ -212,7 +270,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error('Failed to add active filament:', e)
     }
-    queueCaptureSnapshot()
+    queueCaptureSnapshot('Added filament')
   },
   removeActiveFilament: async (uuid) => {
     set((state) => ({
@@ -223,7 +281,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error('Failed to remove active filament:', e)
     }
-    queueCaptureSnapshot()
+    queueCaptureSnapshot('Removed filament')
   },
 
   updateSlider: (index, updates) => {
@@ -237,22 +295,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { colorSliders: newSliders }
     })
-    queueCaptureSnapshot()
+    queueCaptureSnapshot('Color slider edit')
   },
 
   setSettings: (settings) => {
     set({ settings })
-    queueCaptureSnapshot()
+    queueCaptureSnapshot('Settings changed')
   },
   setCurrentJob: (job) => {
+    const prevStatus = get().currentJob?.status
     set({ currentJob: job });
     // When the job completes, mark the STL as available for the 3D preview
     if (job && job.status === 'completed') {
       set({ stlFile: job.job_id })
     }
-    queueCaptureSnapshot()
+    // Only worth a history entry on a real transition (job started, or
+    // reached a terminal state) — not on every progress tick, which would
+    // otherwise queue (and coalesce away) a snapshot write every callback
+    // for the whole duration of a run.
+    if (job && job.status !== prevStatus) {
+      const label = job.status === 'completed' ? 'Optimization completed'
+        : job.status === 'failed' ? 'Optimization failed'
+        : job.status === 'cancelled' ? 'Optimization cancelled'
+        : job.status === 'running' && prevStatus !== 'paused' ? 'Optimization started'
+        : 'Job status changed'
+      queueCaptureSnapshot(label)
+    }
   },
-  setInputImage: (image) => { set({ inputImage: image }); queueCaptureSnapshot() },
+  setInputImage: (image) => { set({ inputImage: image }); queueCaptureSnapshot('Input image changed') },
   setPreviewImage: (image) => set({ previewImage: image }),
   bumpPreviewVersion: () => set((state) => ({ previewVersion: state.previewVersion + 1 })),
   setStlFile: (file) => set({ stlFile: file }),
@@ -268,8 +338,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   setHasRenderedInitPreview: (val) => set({ hasRenderedInitPreview: val }),
   setNewFilamentModalOpen: (open) => set({ newFilamentModalOpen: open }),
   setImportModalOpen: (open) => set({ importModalOpen: open }),
-  setShowDefaultLibrary: (show) => set({ showDefaultLibrary: show }),
   setCustomLibraryLoaded: (loaded) => set({ customLibraryLoaded: loaded }),
+  setEditFilamentModalOpen: (open) => set({ editFilamentModalOpen: open }),
+  setEditingFilament: (filament) => set({ editingFilament: filament }),
+  toggleTheme: () => set((state) => {
+    const next = state.theme === 'dark' ? 'light' : 'dark'
+    applyTheme(next)
+    return { theme: next }
+  }),
 
   loadActiveFilaments: async () => {
     try {
@@ -281,6 +357,73 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch {
       // Use empty list
     }
+  },
+
+  loadCurrentJob: async () => {
+    try {
+      const response = await fetch('/api/optimize/latest')
+      if (!response.ok) return
+      const job: JobStatus = await response.json()
+      set({ currentJob: job })
+      if (job.status === 'completed') set({ stlFile: job.job_id })
+    } catch {
+      // No jobs yet, or backend unreachable — start with none
+    }
+  },
+
+  loadProjectFromFile: async (data) => {
+    if (!data || typeof data !== 'object') throw new Error('Invalid project file')
+    const parsed = data as Partial<{
+      colorSliders: ColorSliderConfig[]
+      settings: OptimizationSettings
+      activeFilaments: Filament[]
+      inputImage: string | null
+    }>
+
+    const state = get()
+
+    // Sync the backend's active-filament list to match the file — clear
+    // what's active now, then re-add what the file specifies. A filament
+    // referenced by the file but missing from the current library (e.g.
+    // loaded on a different machine/profile) is created first so the
+    // reference doesn't silently dangle.
+    if (Array.isArray(parsed.activeFilaments)) {
+      for (const f of state.activeFilaments) {
+        try {
+          await fetch(`/api/filaments/active/${f.uuid}`, { method: 'DELETE' })
+        } catch (_) {}
+      }
+      const libraryRes = await fetch('/api/filaments')
+      const library: Filament[] = await libraryRes.json().catch(() => [])
+      const libraryUuids = new Set(library.map((f) => f.uuid))
+      let libraryChanged = false
+      for (const f of parsed.activeFilaments) {
+        try {
+          if (!libraryUuids.has(f.uuid)) {
+            await fetch('/api/filaments', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(f),
+            })
+            libraryChanged = true
+          }
+          await fetch('/api/filaments/active', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(f),
+          })
+        } catch (_) {}
+      }
+      if (libraryChanged) {
+        const refreshed = await fetch('/api/filaments')
+        set({ filaments: await refreshed.json().catch(() => library) })
+      }
+      get().setActiveFilaments(parsed.activeFilaments)
+    }
+
+    if (parsed.settings) get().setSettings({ ...state.settings, ...parsed.settings })
+    if (Array.isArray(parsed.colorSliders)) get().setSliders(parsed.colorSliders)
+    if (parsed.inputImage !== undefined) get().setInputImage(parsed.inputImage)
   },
 
   runInit: async () => {
@@ -344,10 +487,13 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startPruning: async () => {
     const state = get()
+    if (state.currentJob?.status !== 'completed') {
+      throw new Error("Run an optimization first — there's no result to prune yet.")
+    }
     const response = await fetch('/api/pruning/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(state.pruningSettings),
+      body: JSON.stringify({ ...state.pruningSettings, job_id: state.currentJob.job_id }),
     })
     if (!response.ok) {
       const err = await response.json().catch(() => ({ detail: 'Request failed' }))
@@ -408,22 +554,56 @@ export const useAppStore = create<AppState>((set, get) => ({
       // type exactly, including nested fields like depth_mm and
       // filament_uuid — so this can be applied directly.
       if (data.color_sliders && data.color_sliders.length > 0) set({ colorSliders: data.color_sliders })
+      // `settings` (and therefore which input image is selected) was never
+      // restored here — after a reload the store fell back to hardcoded
+      // defaults even though the backend still had the real settings and
+      // uploaded image on disk, which left `input_image` empty and the Run
+      // button stuck disabled ("upload an image") until the user
+      // re-uploaded, despite nothing actually being wrong.
+      if (data.settings) set({ settings: data.settings })
+      if (data.settings?.input_image) {
+        set({ inputImage: `/uploads/${data.settings.input_image}` })
+      }
     } catch {
       // Use defaults
     }
+
+    // Hydrate the undo/redo + History stack from the backend's persisted
+    // snapshots so both survive a page reload — without this, UNDO_STACK
+    // starts empty every mount and Undo/Redo/History are all inert until
+    // the user makes a fresh edit.
+    try {
+      const histResp = await fetch('/api/state/history')
+      const snapshots: Snapshot[] = await histResp.json()
+      if (Array.isArray(snapshots) && snapshots.length > 0) {
+        const ascending = [...snapshots].sort((a, b) => a.timestamp - b.timestamp)
+        UNDO_STACK.length = 0
+        UNDO_STACK.push(...ascending)
+        if (UNDO_STACK.length > 50) UNDO_STACK.splice(0, UNDO_STACK.length - 50)
+        UNDO_INDEX = UNDO_STACK.length - 1
+        set({
+          historyIndex: UNDO_INDEX,
+          historyLength: UNDO_STACK.length,
+          historyEntries: UNDO_STACK.map(snapshotToHistoryEntry),
+        })
+      }
+    } catch {
+      // No persisted history yet — undo/redo start fresh
+    }
   },
 
-  captureSnapshot: () => {
+  captureSnapshot: (label) => {
     const state = get()
     const snapshot: Snapshot = {
       timestamp: Date.now() / 1000,
-      label: 'State snapshot',
+      label: label || 'State change',
       activeFilaments: state.activeFilaments,
       colorSliders: state.colorSliders,
       settings: state.settings,
       inputImage: state.inputImage,
       currentJobId: state.currentJob?.job_id ?? null,
       optimizationResultId: state.currentJob?.status === 'completed' ? state.currentJob?.job_id : null,
+      jobStatus: state.currentJob?.status ?? null,
     }
 
     fetch('/api/state/snapshot', {
@@ -446,89 +626,95 @@ export const useAppStore = create<AppState>((set, get) => ({
       }),
     }).catch(() => {})
 
+    // A snapshot taken after undoing drops everything ahead of it (the old
+    // "redo" branch) — standard undo-stack semantics, and it also keeps
+    // this array in lockstep with what's actually persisted server-side.
+    UNDO_STACK.splice(UNDO_INDEX + 1)
     UNDO_STACK.push(snapshot)
     if (UNDO_STACK.length > 50) UNDO_STACK.shift()
     UNDO_INDEX = UNDO_STACK.length - 1
-    set({ historyIndex: UNDO_INDEX, historyLength: UNDO_STACK.length })
+    set({
+      historyIndex: UNDO_INDEX,
+      historyLength: UNDO_STACK.length,
+      historyEntries: UNDO_STACK.map(snapshotToHistoryEntry),
+    })
+  },
+
+  restoreToIndex: async (index) => {
+    const state = get()
+    if (index < 0 || index >= UNDO_STACK.length) return
+    const target = UNDO_STACK[index]
+    if (!target) return
+
+    // Stop running job — the state we're jumping to shouldn't have to
+    // race whatever's currently in flight.
+    if (state.currentJob && ['running', 'paused', 'pending'].includes(state.currentJob.status)) {
+      try {
+        await fetch(`/api/optimize/cancel/${state.currentJob.job_id}`, { method: 'POST' })
+      } catch (_) {}
+    }
+
+    try {
+      const resp = await fetch('/api/state/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp: target.timestamp }),
+      })
+      if (!resp.ok) return
+
+      UNDO_INDEX = index
+
+      // Restore whichever job was "current" at snapshot time — without
+      // this, undo/redo/History all lost the completed job's 3D result
+      // (currentJob was unconditionally nulled), even though the snapshot
+      // itself remembers exactly which job that was.
+      let restoredJob: JobStatus | null = null
+      if (target.currentJobId) {
+        try {
+          const jobResp = await fetch(`/api/optimize/status/${target.currentJobId}`)
+          if (jobResp.ok) restoredJob = await jobResp.json()
+        } catch (_) {}
+      }
+
+      set((prev) => ({
+        activeFilaments: target.activeFilaments ?? prev.activeFilaments,
+        colorSliders: target.colorSliders ?? prev.colorSliders,
+        settings: target.settings ?? prev.settings,
+        inputImage: target.inputImage ?? prev.inputImage,
+        historyIndex: UNDO_INDEX,
+        currentJob: restoredJob,
+        stlFile: restoredJob && restoredJob.status === 'completed' ? restoredJob.job_id : null,
+      }))
+      get().bumpPreviewVersion()
+    } catch (_) {}
   },
 
   undo: async () => {
     const state = get()
     if (state.historyIndex <= 0) return
-
-    const targetIndex = state.historyIndex - 1
-    const target = UNDO_STACK[targetIndex]
-    if (!target) return
-
-    // Stop running job
-    if (state.currentJob) {
-      try {
-        await fetch(`/api/optimize/cancel/${state.currentJob.job_id}`, { method: 'POST' })
-      } catch (_) {}
-    }
-
-    try {
-      const resp = await fetch('/api/state/restore', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timestamp: target.timestamp }),
-      })
-      if (resp.ok) {
-        UNDO_INDEX = targetIndex
-        set((prev) => ({
-          activeFilaments: target.activeFilaments ?? prev.activeFilaments,
-          colorSliders: target.colorSliders ?? prev.colorSliders,
-          settings: target.settings ?? prev.settings,
-          inputImage: target.inputImage ?? prev.inputImage,
-          historyIndex: UNDO_INDEX,
-          currentJob: null,
-        }))
-      }
-    } catch (_) {}
+    await get().restoreToIndex(state.historyIndex - 1)
   },
 
   redo: async () => {
     const state = get()
-    const nextIndex = state.historyIndex + 1
-    if (nextIndex >= UNDO_STACK.length) return
-
-    const target = UNDO_STACK[nextIndex]
-    if (!target) return
-
-    if (state.currentJob) {
-      try {
-        await fetch(`/api/optimize/cancel/${state.currentJob.job_id}`, { method: 'POST' })
-      } catch (_) {}
-    }
-
-    try {
-      const resp = await fetch('/api/state/restore', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timestamp: target.timestamp }),
-      })
-      if (resp.ok) {
-        UNDO_INDEX = nextIndex
-        set((prev) => ({
-          activeFilaments: target.activeFilaments ?? prev.activeFilaments,
-          colorSliders: target.colorSliders ?? prev.colorSliders,
-          settings: target.settings ?? prev.settings,
-          inputImage: target.inputImage ?? prev.inputImage,
-          historyIndex: UNDO_INDEX,
-          currentJob: null,
-        }))
-      }
-    } catch (_) {}
+    if (state.historyIndex >= UNDO_STACK.length - 1) return
+    await get().restoreToIndex(state.historyIndex + 1)
   },
 }))
 // Debounced snapshot queue — safe from infinite loops because captureSnapshot
-// only calls set({ historyIndex, historyLength }) which doesn't re-trigger this
+// only calls set({ historyIndex, historyLength, historyEntries }), none of
+// which re-trigger this (they're written via plain `set`, not the setter
+// actions that call queueCaptureSnapshot).
 let snapshotTimer: ReturnType<typeof setTimeout> | null = null
+let pendingLabel: string | undefined
 
-function queueCaptureSnapshot() {
+function queueCaptureSnapshot(label?: string) {
+  if (label) pendingLabel = label
   if (snapshotTimer) clearTimeout(snapshotTimer)
   snapshotTimer = setTimeout(() => {
-    useAppStore.getState().captureSnapshot()
+    const label = pendingLabel
+    pendingLabel = undefined
+    useAppStore.getState().captureSnapshot(label)
   }, 500)
 }
 

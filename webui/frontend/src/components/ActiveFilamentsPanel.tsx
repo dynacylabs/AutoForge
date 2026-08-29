@@ -12,11 +12,21 @@ export const ActiveFilamentsPanel: React.FC = () => {
     removeActiveFilament(uuid)
   }
 
-  // When first filament is added and we have an image, trigger init
+  // Trigger init on the rising edge of "we have both an image and at least
+  // one active filament" — not on the filament count alone. Previously
+  // gated on `activeFilaments.length === 1`, which (a) only ever fired for
+  // the very first filament, never a later one added while the count was
+  // already >= 1, and (b) fired a *second*, redundant `runInit()` (racing
+  // InputImagePanel's own direct call and failing with "Already
+  // initializing") whenever an image finished uploading while exactly one
+  // filament happened to already be active.
+  const readyBeforeRef = React.useRef(activeFilaments.length > 0 && !!inputImage)
   React.useEffect(() => {
-    if (activeFilaments.length === 1 && inputImage) {
+    const readyNow = activeFilaments.length > 0 && !!inputImage
+    if (readyNow && !readyBeforeRef.current) {
       runInit()
     }
+    readyBeforeRef.current = readyNow
   }, [activeFilaments.length, inputImage, runInit])
 
   return (

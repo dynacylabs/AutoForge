@@ -6,7 +6,6 @@ export const InputImagePanel: React.FC = () => {
   const inputImage = useAppStore((s) => s.inputImage)
   const setInputImage = useAppStore((s) => s.setInputImage)
   const setSettings = useAppStore((s) => s.setSettings)
-  const runInit = useAppStore((s) => s.runInit)
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -29,14 +28,17 @@ export const InputImagePanel: React.FC = () => {
       // Read current settings from the store to avoid stale closures
       const current = useAppStore.getState().settings
       setSettings({ ...current, input_image: data.filename })
-      // Attempt init; server will reject with 400 if no active filaments
-      runInit()
+      // Init is triggered reactively by ActiveFilamentsPanel's effect (it
+      // watches for the image+filaments-present transition from both
+      // directions) — calling it here too raced that effect whenever
+      // filaments were already active, firing runInit() twice and logging
+      // a spurious "Already initializing" rejection for the second one.
     } catch (e) {
       console.error('Failed to upload image:', e)
       const url = URL.createObjectURL(file)
       setInputImage(url)
     }
-  }, [setInputImage, setSettings, runInit])
+  }, [setInputImage, setSettings])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()

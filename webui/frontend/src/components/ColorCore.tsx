@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
+import { filterActiveHandles } from '../lib/colorStack'
 
 interface HandleData {
   storeIndex: number
@@ -84,13 +85,32 @@ export const ColorCore: React.FC = () => {
     }))
   }, [colorSliders, getFilamentColor])
 
+  // Sliders are now allowed to share a layer (dragged on top of one
+  // another). Only one handle can actually own a given layer for coloring
+  // purposes — the one furthest right (highest storeIndex) wins; the rest
+  // are dimmed in the handle list and excluded here so segment colors never
+  // depend on more than one owner per layer.
+  const activeHandles = useMemo(() => filterActiveHandles(handles), [handles])
+  const overlapDisabled = useMemo(() => {
+    const activeIndices = new Set(activeHandles.map((h) => h.storeIndex))
+    return new Set(handles.filter((h) => !activeIndices.has(h.storeIndex)).map((h) => h.storeIndex))
+  }, [handles, activeHandles])
+
   const segments: SegmentData[] = useMemo(() => {
+    const handles = activeHandles
     if (handles.length === 0) return []
 
     const maxLayer = handles[handles.length - 1].value
     const result: SegmentData[] = []
 
-    for (let layer = 1; layer <= maxLayer; layer++) {
+    // Rendered top-to-bottom in DOM order, so this must walk from the
+    // highest layer down to 1 — the handles column places the highest
+    // layer at the top (`layerToY` mirrors a physical print: layer 1 at
+    // the bottom), and the segment track has to agree with it. Iterating
+    // ascending here put layer 1 at the top of the DOM instead, so a
+    // handle dragged to a high layer highlighted a band near the *bottom*
+    // of the track instead of near its own arrow.
+    for (let layer = maxLayer; layer >= 1; layer--) {
       let owningHandleIdx = handles.length - 1
       for (let h = 0; h < handles.length; h++) {
         if (layer <= handles[h].value) {
@@ -148,7 +168,7 @@ export const ColorCore: React.FC = () => {
     }
 
     return result
-  }, [handles])
+  }, [activeHandles])
 
   const layerToY = useCallback(
     (layer: number): number => {
@@ -191,8 +211,13 @@ export const ColorCore: React.FC = () => {
     const prevHandle = draggingHandle > 0 ? activeSliders[draggingHandle - 1] : null
     const nextHandle = draggingHandle < activeSliders.length - 1 ? activeSliders[draggingHandle + 1] : null
 
-    const minLayer = prevHandle ? prevHandle.layer + 1 : 1
-    const maxLayer = nextHandle ? nextHandle.layer - 1 : sliderLayerRange.max
+    // Sliders may now be dragged onto the exact same layer as a neighbor
+    // (that's how "move over one another" works) — bounds are inclusive of
+    // the neighbor's own layer instead of stopping one short of it. This
+    // also fixes the previous exclusive bounds going invalid (min > max)
+    // whenever two neighbors were already only 1 layer apart.
+    const minLayer = prevHandle ? prevHandle.layer : 1
+    const maxLayer = nextHandle ? nextHandle.layer : sliderLayerRange.max
 
     const handleMove = (clientY: number) => {
       if (!containerRef.current) return
@@ -232,7 +257,7 @@ export const ColorCore: React.FC = () => {
       window.removeEventListener('touchmove', onTouchMove)
       window.removeEventListener('touchend', onEnd)
     }
-  }, [draggingHandle, colorSliders, updateSlider])
+  }, [draggingHandle, colorSliders, updateSlider, sliderLayerRange.max])
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -285,16 +310,19 @@ export const ColorCore: React.FC = () => {
               {handles.map((handle, idx) => {
                 const yPos = layerToY(handle.value)
                 const isFocused = focusedHandle === idx
+                const isOverlapDisabled = overlapDisabled.has(handle.storeIndex)
 
                 return (
                   <div
                     key={handle.storeIndex}
                     className="absolute left-0 flex items-center cursor-grab active:cursor-grabbing select-none"
-                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)' }}
+                    style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1 }}
                     onMouseDown={handleMouseDown(idx)}
                     onTouchStart={handleTouchStart(idx)}
                     data-testid={`color-core-handle-${idx}`}
                     data-layer={handle.value}
+                    data-overlap-disabled={isOverlapDisabled || undefined}
+                    title={isOverlapDisabled ? 'This filament is covered by another slider on the same layer' : undefined}
                   >
                     <div
                       className={`flex items-center pl-1 pr-0.5 py-0.5 rounded-l text-xs font-mono font-bold shadow transition-all ${

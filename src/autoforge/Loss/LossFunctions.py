@@ -4,7 +4,10 @@ import torch
 import torch.nn.functional as F
 
 from autoforge.Helper.ImageHelper import srgb_to_lab
-from autoforge.Helper.OptimizerHelper import composite_image_cont
+from autoforge.Helper.OptimizerHelper import (
+    composite_image_cont,
+    composite_image_cont_lowmem,
+)
 
 
 def loss_fn(
@@ -21,6 +24,8 @@ def loss_fn(
     focus_map: torch.Tensor = None,
     alpha: torch.Tensor = None,
     compute_dtype: Optional[torch.dtype] = None,
+    gumbel_exp: Optional[torch.Tensor] = None,
+    low_memory: bool = False,
 ) -> torch.Tensor:
     """
     Full forward pass for continuous assignment:
@@ -32,8 +37,12 @@ def loss_fn(
         per-layer compositing math runs in this precision instead of fp32 -
         see composite_image_cont for why this has to be threaded through
         explicitly rather than relying on ambient torch.autocast.
+    gumbel_exp (optional): pre-drawn Exponential(1) noise for the material
+        Gumbel-Softmax, so the RNG draw can be kept outside a CUDA-graph
+        capture region - see composite_image_cont.
     """
-    comp = composite_image_cont(
+    composite = composite_image_cont_lowmem if low_memory else composite_image_cont
+    comp = composite(
         params["pixel_height_logits"],
         params["global_logits"],
         tau_height,
@@ -44,6 +53,7 @@ def loss_fn(
         material_TDs,
         background,
         compute_dtype,
+        gumbel_exp,
     )
     return compute_loss(
         comp=comp,

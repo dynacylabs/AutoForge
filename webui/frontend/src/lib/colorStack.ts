@@ -45,6 +45,30 @@ export function getStackHandles(colorSliders: ColorSliderConfig[], filaments: Fi
     }))
 }
 
+/** Sliders are allowed to share a layer (dragging one over another is a
+ * normal interaction, not an error) — but only one of them can actually own
+ * that print layer for coloring/compositing purposes. When two or more
+ * handles land on the same layer, the one further right in the column order
+ * (the highest `storeIndex`) wins; the rest are silently excluded here. */
+export function filterActiveHandles(handles: StackHandle[]): StackHandle[] {
+  const winnerByValue = new Map<number, number>()
+  for (const h of handles) {
+    const current = winnerByValue.get(h.value)
+    if (current === undefined || h.storeIndex > current) winnerByValue.set(h.value, h.storeIndex)
+  }
+  return handles.filter((h) => winnerByValue.get(h.value) === h.storeIndex)
+}
+
+/** Store indices of sliders that currently lose a layer-overlap tie (see
+ * `filterActiveHandles`) — used to dim/mark them in the UI without touching
+ * their `enabled` flag, so they silently stop affecting the print until
+ * moved off the shared layer. */
+export function getOverlapDisabledIndices(colorSliders: ColorSliderConfig[], filaments: Filament[]): Set<number> {
+  const handles = getStackHandles(colorSliders, filaments)
+  const activeIndices = new Set(filterActiveHandles(handles).map((h) => h.storeIndex))
+  return new Set(handles.filter((h) => !activeIndices.has(h.storeIndex)).map((h) => h.storeIndex))
+}
+
 /** One entry per print layer (1..maxLayer), color-blended between the
  * handle below and at each layer — same interpolation ColorCore uses. */
 export function getStackSegments(handles: StackHandle[]): StackSegment[] {

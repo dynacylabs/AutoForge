@@ -14,15 +14,20 @@ router = APIRouter()
 async def start_pruning(settings: PruningSettings):
     svc = get_optimization_service()
 
-    # Find the last completed optimization job
-    history = svc.get_history()
-    completed_jobs = [j for j in history if j.status == "completed"]
-    if not completed_jobs:
-        raise HTTPException(400, "No completed optimization result to prune")
-
-    # Use the most recent completed job
-    latest_job = completed_jobs[0]
-    job_id = latest_job.job_id
+    # Pruning must operate on the specific result the frontend is looking
+    # at (its `currentJob`) — not "whatever completed job happens to be
+    # most recent in history". This backend keeps job records across
+    # restarts, so without pinning to an explicit job_id, a user could open
+    # the app fresh (no optimization run yet this session) and still
+    # successfully "prune" some unrelated leftover job from a previous
+    # session/image. Requiring — and validating — job_id closes that gap
+    # and also naturally blocks pruning before any optimization has run.
+    if not settings.job_id:
+        raise HTTPException(400, "Run an optimization first — there's no result to prune yet.")
+    target_job = svc.get_job(settings.job_id)
+    if not target_job or target_job.status != "completed":
+        raise HTTPException(400, "Run an optimization first — there's no completed result to prune yet.")
+    job_id = target_job.job_id
 
     # Create a pruning job via the public API
     import datetime
@@ -61,34 +66,50 @@ async def start_pruning(settings: PruningSettings):
             pipeline_result["args"] = args
 
             # Report pruning progress through the optimizer's preview callback
-            # so the frontend can show it in the top progress bar. The raw
-            # per-pass percentages from PruningHelper are stage-relative and
-            # non-monotonic (mostly ≤0 during color/layer reduction, then a
-            # jump to 90-99 for swap-position optimisation), so we map them
-            # onto a monotonic 0-100 scale.
+            # so the frontend can show it in the top progress bar. Pruning
+            # runs through several genuinely distinct phases in a fixed
+            # order (see FilamentOptimizer.prune's `_current_prune_phase`),
+            # each raising its own preview_callback(..., phase=<name>) calls
+            # with a stage-relative, non-monotonic percent (negative,
+            # climbing to 0 for the reduction phases; ~90-99 for swap
+            # position optimisation). Give each phase an equal-width slice
+            # of the 0-100 bar instead of the old percent-magnitude
+            # heuristics, which happened to lump colour/swap/layer
+            # reduction into one shared 50%-wide bucket (they all report
+            # percent <= 0) while swap-position optimisation alone got the
+            # other half.
             optimizer = pipeline_result["optimizer"]
+            phases = ["Reducing colors", "Reducing swaps", "Reducing layers", "Optimising swap positions", "Fine-tuning height"]
+            phase_slice = 100.0 / len(phases)
             _last = 0.0
-            _min_seen = 0.0
+            _phase_min_seen: dict[str, float] = {}
 
             def _prune_progress(_optimizer, _percent, phase=None):
-                nonlocal _last, _min_seen
-                if _percent >= 90:
-                    # Swap-position optimisation phase: report as-is (90-99).
-                    p = float(_percent)
-                elif _percent > 0:
-                    # Swap reduction phase: roughly the middle of the work.
-                    p = 55 + min(float(_percent), 100.0) * 0.30
-                elif _percent >= _min_seen:
-                    # Color/layer reduction phase: values climb from a very
-                    # negative start toward 0 as materials/layers are merged.
-                    _min_seen = min(_min_seen, float(_percent))
-                    denom = max(1e-9, 0.0 - _min_seen)
-                    p = 5 + 50.0 * ((float(_percent) - _min_seen) / denom)
+                nonlocal _last
+                phase_name = phase or phases[0]
+                phase_idx = phases.index(phase_name) if phase_name in phases else 0
+                bucket_start = phase_idx * phase_slice
+
+                if phase_name == "Optimising swap positions":
+                    # Raw percent here is "90 + pass number" (capped at 99) —
+                    # a small incrementing pass counter, not a 0-100 fraction
+                    # of this phase's own work. Rescale it onto this phase's
+                    # slice instead of taking it as an absolute percentage.
+                    within = min(1.0, max(0.0, (float(_percent) - 90.0) / 9.0))
                 else:
-                    _min_seen = float(_percent)
-                    p = 5.0
+                    # Colour/swap/layer reduction: percent starts very
+                    # negative and climbs toward 0 as the search converges.
+                    # Track each phase's own low-water mark separately so
+                    # they don't share (and corrupt) one running minimum.
+                    seen = min(_phase_min_seen.get(phase_name, float(_percent)), float(_percent))
+                    _phase_min_seen[phase_name] = seen
+                    denom = 0.0 - seen
+                    within = (float(_percent) - seen) / denom if denom > 1e-9 else 0.0
+                    within = min(1.0, max(0.0, within))
+
+                p = bucket_start + within * phase_slice
                 _last = max(_last, min(p, 100.0))
-                svc.update_status(prune_job_id, "running", progress=_last, phase=phase)
+                svc.update_status(prune_job_id, "running", progress=_last, phase=phase_name)
 
             optimizer.preview_callback = _prune_progress
 

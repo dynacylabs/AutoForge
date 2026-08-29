@@ -272,6 +272,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--cuda_graph",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Capture the training forward/backward into a CUDA graph (CUDA only). "
+        "Large speedup for the launch-overhead-bound training loop; "
+        "--no-cuda_graph falls back to plain eager steps.",
+    )
+
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=0,
@@ -779,6 +788,13 @@ def _run_optimization_loop(
                     "steps without improvement.",
                 )
                 break
+    # Free the captured graph's private memory pool before the (higher
+    # resolution) post-processing phases start allocating. `loss_val` aliases
+    # storage inside that pool on the graph path, so it has to go first or the
+    # pool stays pinned for the rest of the run.
+    loss_val = None
+    del loss_val
+    optimizer.release_cuda_graph()
 
 
 def _post_optimize_and_export(

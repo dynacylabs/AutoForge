@@ -36,6 +36,24 @@ _OPAC_O, _OPAC_A, _OPAC_K, _OPAC_B = (
 )
 
 
+def _dedupe_overlapping_layers(sliders: list[dict]) -> list[dict]:
+    """Sliders may share a ``layer`` value — the frontend lets you drag one
+    on top of another instead of blocking it. Only one can actually own that
+    print layer though: mirroring the frontend's ColorCore/ColorSliders
+    tie-break, the slider that appears last in column order (the highest
+    original index, i.e. furthest right) wins; the rest are dropped here so
+    the compositor never has two candidate materials for the same layer."""
+    winner_by_layer: dict[int, int] = {}
+    for orig_idx, s in enumerate(sliders):
+        if not s.get("enabled") or int(s.get("layer", 0)) <= 0:
+            continue
+        layer = int(s["layer"])
+        if layer not in winner_by_layer or orig_idx > winner_by_layer[layer]:
+            winner_by_layer[layer] = orig_idx
+    winners = set(winner_by_layer.values())
+    return [s for i, s in enumerate(sliders) if i in winners]
+
+
 def _layer_material_indices(sliders: list[dict], max_layers: int) -> np.ndarray:
     """Map each stack layer (0-indexed, length ``max_layers``) to a slot in
     ``sliders`` (already filtered to enabled, sorted by ``layer`` ascending).
@@ -148,10 +166,7 @@ def render_with_sliders(
     max_layers = int(optimizer.max_layers)
     h = float(getattr(args, "layer_height", 0.04))
 
-    enabled = sorted(
-        (s for s in sliders if s.get("enabled") and int(s.get("layer", 0)) > 0),
-        key=lambda s: int(s["layer"]),
-    )
+    enabled = sorted(_dedupe_overlapping_layers(sliders), key=lambda s: int(s["layer"]))
     if not enabled:
         return None
 

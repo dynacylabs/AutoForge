@@ -37,6 +37,19 @@ fi
 # Start the FastAPI server
 # ---------------------------------------------------------------------------
 echo "[webui] Starting server on http://${HOST}:${PORT}"
+
+if [ "${NO_BROWSER:-false}" != "true" ]; then
+    BROWSER_URL="http://localhost:${PORT}"
+    (
+        sleep 2
+        if command -v xdg-open &>/dev/null; then
+            xdg-open "$BROWSER_URL" &>/dev/null
+        elif command -v open &>/dev/null; then
+            open "$BROWSER_URL" &>/dev/null
+        fi
+    ) &
+fi
+
 exec uv run uvicorn autoforge.webui.server:app \
     --host "$HOST" \
     --port "$PORT" \
