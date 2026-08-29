@@ -771,8 +771,8 @@ def _run_optimization_loop(
         for i in tbar:
             loss_val = optimizer.step(record_best=i % args.discrete_check == 0)
 
-            optimizer.visualize(interval=100)
-            optimizer.log_to_tensorboard(interval=100)
+            optimizer.visualize(interval=500)
+            optimizer.log_to_tensorboard(interval=500)
 
             if (i + 1) % 100 == 0:
                 tbar.set_description(
