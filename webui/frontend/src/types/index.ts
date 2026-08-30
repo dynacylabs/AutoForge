@@ -47,6 +47,9 @@ export interface OptimizationSettings {
   pruning_max_swaps: number
   pruning_max_layer: number
   random_seed: number
+  /** Torch device override ('cuda', 'cuda:1', 'mps', 'cpu'); null = auto-detect. */
+  device: string | null
+  /** @deprecated Metal is auto-detected now; use `device: 'mps'` instead. */
   mps: boolean
   run_name: string | null
   tensorboard: boolean

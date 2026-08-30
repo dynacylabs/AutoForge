@@ -6,6 +6,15 @@ import urllib.request
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 import torch
+
+from autoforge.Helper.DeviceUtils import (
+    backend_of,
+    cuda_is_available,
+    describe_device,
+    is_rocm,
+    mps_is_available,
+    resolve_device,
+)
 from fastapi import APIRouter
 
 router = APIRouter()
@@ -78,26 +87,31 @@ async def check_for_update():
 
 @router.get("/info")
 async def system_info():
-    mps_available = torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False
-    cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        device = "cuda"
-    elif mps_available:
-        device = "mps"
-    else:
-        device = "cpu"
+    device = resolve_device()
+    cuda_available = cuda_is_available()
+    mps_available = mps_is_available()
     return {
         "torchVersion": torch.__version__,
+        # PyTorch reports AMD GPUs through the CUDA API, so `cudaAvailable`
+        # stays True on ROCm (existing clients depend on that); `backend`
+        # is what actually distinguishes the two.
         "cudaAvailable": cuda_available,
         "mpsAvailable": mps_available,
-        "device": device,
+        "rocmAvailable": cuda_available and is_rocm(),
+        "backend": backend_of(device),
+        "device": str(device),
+        "deviceDescription": describe_device(device),
     }
 
 
 @router.get("/device")
 async def available_devices():
-    devices = ["cpu"]
-    if torch.cuda.is_available():
+    """Every device the user could select, most capable first."""
+    devices = []
+    if cuda_is_available():
         for i in range(torch.cuda.device_count()):
             devices.append(f"cuda:{i}")
-    return {"devices": devices}
+    if mps_is_available():
+        devices.append("mps")
+    devices.append("cpu")
+    return {"devices": devices, "default": str(resolve_device())}

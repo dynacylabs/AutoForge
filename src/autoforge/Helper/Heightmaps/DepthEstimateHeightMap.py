@@ -8,6 +8,8 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import silhouette_score
 from sklearn.utils._testing import ignore_warnings
 
+from autoforge.Helper.DeviceUtils import accelerator_device
+
 
 def initialize_pixel_height_logits(target):
     """
@@ -97,10 +99,25 @@ def init_height_map_depth_color_adjusted(
 
     target_uint8 = target.astype(np.uint8)
     image_pil = Image.fromarray(target_uint8)
-    pipe = pipeline(
-        task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf"
-    )
-    depth_result = pipe(image_pil)
+    # Run the depth model on whatever accelerator is present. transformers
+    # defaults to CPU, which left this init several times slower than it needs
+    # to be on every GPU, Apple Silicon included. A backend that chokes on the
+    # model falls back to CPU rather than failing the run.
+    accel = accelerator_device()
+    try:
+        pipe = pipeline(
+            task="depth-estimation",
+            model="depth-anything/Depth-Anything-V2-Small-hf",
+            device=accel,
+        )
+        depth_result = pipe(image_pil)
+    except Exception:
+        if accel is None:
+            raise
+        pipe = pipeline(
+            task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf"
+        )
+        depth_result = pipe(image_pil)
     depth_map = depth_result["depth"]
     if hasattr(depth_map, "convert"):
         depth_map = np.array(depth_map)

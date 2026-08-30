@@ -43,6 +43,7 @@ from tqdm import tqdm
 
 from autoforge.Helper import PruningHelper
 from autoforge.Helper.AmpUtils import safe_autocast
+from autoforge.Helper.DeviceUtils import empty_cache
 from autoforge.Helper.FilamentHelper import hex_to_rgb, load_materials
 from autoforge.Helper.Heightmaps.FastTSPHeightMap import (
     run_init_threads,
@@ -275,7 +276,8 @@ def parse_args() -> argparse.Namespace:
         "--cuda_graph",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Capture the training forward/backward into a CUDA graph (CUDA only). "
+        help="Capture the training forward/backward into a CUDA/HIP graph "
+        "(NVIDIA and AMD GPUs only; ignored on Apple Metal and CPU). "
         "Large speedup for the launch-overhead-bound training loop; "
         "--no-cuda_graph falls back to plain eager steps.",
     )
@@ -288,9 +290,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device to run on, e.g. 'cuda', 'cuda:1', 'mps', 'cpu'. "
+        "Defaults to auto-detection (CUDA/ROCm, then Apple Metal, then CPU). "
+        "Can also be set with the AUTOFORGE_DEVICE environment variable.",
+    )
+
+    parser.add_argument(
         "--mps",
         action="store_true",
-        help="Use the Metal Performance Shaders (MPS) backend, if available.",
+        help="Deprecated: Apple Metal (MPS) is now detected automatically. "
+        "Kept only to force MPS on a machine that also exposes a CUDA GPU; "
+        "prefer --device mps.",
     )
 
     parser.add_argument(
@@ -1144,7 +1157,7 @@ def start(args) -> float:
         for _ in range(60):
             optimizer._maybe_update_best_discrete()
 
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     # Post-process, prune, and export outputs
     final_loss = _post_optimize_and_export(
@@ -1173,7 +1186,8 @@ def main() -> None:
     - Tracks losses, reports statistics (best / median / std).
     - Moves files from best run folder into the final output folder.
 
-    Note: Memory is periodically reclaimed (gc + CUDA cache clears + closing matplotlib figures).
+    Note: Memory is periodically reclaimed (gc + GPU cache clears on whichever
+    backend is active + closing matplotlib figures).
     """
     args = parse_args()
     final_output_folder = args.output_folder
@@ -1195,11 +1209,11 @@ def main() -> None:
                     run_best_loss = run_loss
                     print(f"New best loss found: {run_best_loss} in run {i + 1}")
                 ret.append((run_folder, run_loss))
-                torch.cuda.empty_cache()
+                empty_cache()
                 import gc
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
                 import matplotlib.pyplot as plt
 
                 plt.close("all")

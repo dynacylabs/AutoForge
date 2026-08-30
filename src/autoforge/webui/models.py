@@ -64,6 +64,10 @@ class OptimizationSettings(CamelCaseModel):
     pruning_max_swaps: int = 100
     pruning_max_layer: int = 75
     random_seed: int = 0
+    # Empty/None means auto-detect (CUDA/ROCm, then Apple Metal, then CPU).
+    device: Optional[str] = None
+    # Deprecated: Metal is auto-detected now. Kept so older clients that still
+    # post `mps: true` keep working.
     mps: bool = False
     run_name: Optional[str] = None
     tensorboard: bool = False

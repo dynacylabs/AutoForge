@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from autoforge.Helper.CAdamW import CAdamW
+from autoforge.Helper.DeviceUtils import (
+    backend_of,
+    empty_cache,
+    supports_graph_capture,
+    synchronize,
+)
 from autoforge.Helper.OptimizerHelper import (
     batched_layer_material_indices,
     composite_image_cont,
@@ -469,7 +475,13 @@ class FilamentOptimizer:
             self.optimizer.step()
 
     def _maybe_capture_graph(self, tau_height: float, tau_global: float) -> None:
-        """Capture the forward/backward of one training step into a CUDA graph.
+        """Capture the forward/backward of one training step into a GPU graph.
+
+        CUDA-family backends only - NVIDIA CUDA and AMD ROCm, where the same
+        ``torch.cuda.CUDAGraph`` API maps onto HIP graphs. Apple Metal has no
+        equivalent and CPU has nothing to gain, so ``supports_graph_capture``
+        turns both away before any ``torch.cuda`` call is made and they take
+        the eager path below unchanged.
 
         The training step is dominated by kernel-launch overhead rather than
         GPU work at realistic solver resolutions (measured at the default
@@ -494,7 +506,7 @@ class FilamentOptimizer:
             not self._graph_enabled
             or self._graph_attempted
             or self.num_steps_done < self._graph_capture_after
-            or self.device.type != "cuda"
+            or not supports_graph_capture(self.device)
             or self.precision.scaler is not None
         ):
             return
@@ -503,7 +515,7 @@ class FilamentOptimizer:
             # Return the eager path's cached-but-free blocks to the driver so
             # the graph's private pool grows from a clean state instead of on
             # top of them (the private pool cannot reuse main-pool blocks).
-            torch.cuda.empty_cache()
+            empty_cache(self.device)
             self.optimizer.zero_grad(set_to_none=False)
 
             graph = torch.cuda.CUDAGraph()
@@ -517,25 +529,85 @@ class FilamentOptimizer:
             del captured_loss
             self._graph = graph
             self._graph_tau = (tau_height, tau_global)
+
+            # A capture that *succeeds* is not yet a capture that *replays
+            # correctly*: on backends where graph support is thinner than
+            # NVIDIA's (ROCm maps this onto HIP graphs) a bad replay shows up
+            # as wrong numbers, not as an exception, and every subsequent
+            # step would silently train on garbage gradients. So replay once
+            # and check it against an eager step before handing the training
+            # loop over to it. Costs one extra forward/backward, once.
+            if not self._graph_replay_matches_eager(tau_height, tau_global):
+                graph.reset()
+                self._graph = None
+                self._graph_loss = None
+                self._graph_tau = None
+                print(
+                    f"Graph replay disagreed with the eager step on this "
+                    f"{backend_of(self.device)} device; using eager steps."
+                )
         except Exception as exc:  # pragma: no cover - hardware/driver dependent
             self._graph = None
             self._graph_loss = None
             self._graph_tau = None
-            print(f"CUDA graph capture unavailable ({exc}); using eager steps.")
+            print(f"Graph capture unavailable ({exc}); using eager steps.")
         finally:
             self.optimizer.zero_grad(set_to_none=False)
+
+    def _validated_params(self):
+        return [self.params["global_logits"], self.height_offsets]
+
+    def _graph_replay_matches_eager(
+        self, tau_height: float, tau_global: float
+    ) -> bool:
+        """Does replaying the captured graph reproduce the eager loss+grads?
+
+        Both runs see identical inputs - parameters are untouched by
+        forward/backward and ``_gumbel_exp`` was drawn once for this step - so
+        they should agree to within kernel non-determinism (backward reductions
+        use atomics, so this is a tolerance check rather than bit equality).
+        The failure this guards against is not a 1% drift but a replay that
+        produces zeros or garbage, which no tolerance hides.
+        """
+        params = self._validated_params()
+        try:
+            self.optimizer.zero_grad(set_to_none=False)
+            eager_loss = self._forward_backward(tau_height, tau_global).detach().clone()
+            eager_grads = [p.grad.detach().clone() for p in params]
+
+            self.optimizer.zero_grad(set_to_none=False)
+            self._graph.replay()
+            replay_loss = self._graph_loss.detach().clone()
+            replay_grads = [p.grad.detach().clone() for p in params]
+        except Exception:
+            return False
+
+        if not torch.isfinite(replay_loss).all():
+            return False
+        if not torch.allclose(eager_loss, replay_loss, rtol=1e-2, atol=1e-3):
+            return False
+        # An all-zero eager gradient carries no signal to compare against
+        # (it would make a dead replay look correct); accept in that case,
+        # since a step with no gradient cannot be trained wrong either.
+        if not any(float(g.abs().max()) > 0.0 for g in eager_grads):
+            return True
+        for eager_g, replay_g in zip(eager_grads, replay_grads):
+            if not torch.allclose(eager_g, replay_g, rtol=1e-2, atol=1e-4):
+                return False
+        return True
 
     def release_cuda_graph(self) -> None:
         """Drop the captured graph and its private memory pool.
 
         Called once training finishes so the pool can be reclaimed before the
         (higher-resolution, more memory-hungry) post-processing phases run.
+        A no-op when nothing was captured, which is every Metal and CPU run.
         """
         if self._graph is None:
             return
         # Every kernel from the last replay has to have finished before the
         # graph's private pool goes away.
-        torch.cuda.synchronize()
+        synchronize(self.device)
         if self.loss is not None:
             # self.loss aliases the graph's private pool; detach it from that
             # storage before the pool goes away.
@@ -554,8 +626,8 @@ class FilamentOptimizer:
         self._graph_loss = None
         self._graph_tau = None
         gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        synchronize(self.device)
+        empty_cache(self.device)
 
     def step(self, record_best: bool = False):
         """
@@ -573,7 +645,7 @@ class FilamentOptimizer:
             self.pixel_height_logits.grad = None
 
         # set_to_none=False keeps every .grad tensor at a stable address, which
-        # a captured CUDA graph requires (it replays writes to the exact
+        # a captured graph requires (it replays writes to the exact
         # buffers recorded at capture time). Numerically a no-op: backward
         # accumulates onto exact zeros instead of assigning a fresh tensor.
         self.optimizer.zero_grad(set_to_none=False)
@@ -594,7 +666,7 @@ class FilamentOptimizer:
         tau_height, tau_global = self._get_tau()
 
         # Draw this step's Gumbel noise here, outside any captured region, so
-        # the eager and CUDA-graph paths consume the identical random stream.
+        # the eager and graph-replay paths consume the identical random stream.
         self._gumbel_exp.exponential_()
 
         if self._graph is not None and self._graph_tau == (tau_height, tau_global):
@@ -1042,11 +1114,11 @@ class FilamentOptimizer:
             print(f"Pre-prune discrete loss: {current_loss:.4f}")
 
         # clear pytorch and system cache to reduce vram usage
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
         import gc
 
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
 
         # Build a combined callback that updates the matplotlib window (CLI)
         # and also fires the external WebSocket callback (WebUI), tagged

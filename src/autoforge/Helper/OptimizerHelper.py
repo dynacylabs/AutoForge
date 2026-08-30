@@ -689,7 +689,13 @@ def composite_image_disc(
 
 
 def _gpu_capability(device):
-    major, minor = torch.cuda.get_device_capability(device)
+    """CUDA compute capability as an int (80, 61, …); 0 on non-CUDA backends."""
+    if getattr(device, "type", None) != "cuda":
+        return 0
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return 0
     return major * 10 + minor  # 80, 61, …
 
 
@@ -716,16 +722,26 @@ class PrecisionManager:
         # Decide dtype once using the shared runtime probe
         dtype, _reason = get_selected_autocast(device)
         self.autocast_dtype = dtype
-        # Enable only when a non-None dtype is selected and device supports native CUDA autocast
-        self.enabled = dtype is not None and device.type == "cuda"
+        # GPU backends only. CPU bf16 is deliberately excluded: the probe may
+        # accept it, but enabling it here would also switch
+        # `composite_compute_dtype` to bf16 and change CPU-run results, which
+        # is not what a CPU fallback run should silently do.
+        # `device.type == "cuda"` covers ROCm too - PyTorch reports AMD GPUs
+        # as CUDA devices - and MPS only reaches here via an explicit
+        # AUTOFORGE_AMP override that already passed the runtime probe.
+        self.enabled = dtype is not None and device.type in ("cuda", "mps")
 
-        # Use GradScaler only for CUDA float16; bf16 does not need scaling
+        # Use GradScaler only for float16; bf16 does not need scaling.
+        # torch.amp.GradScaler takes the device type, so the same call works
+        # for CUDA, ROCm and MPS (the old torch.cuda.amp.GradScaler was both
+        # deprecated and hard-wired to CUDA).
         if self.enabled and dtype == torch.float16:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler(device.type)
         else:
             self.scaler = None
 
-        # Optional: If CUDA but no AMP selected, allow TF32 for speed on Ampere+
+        # Optional: If a CUDA-family GPU but no AMP selected, allow TF32 for
+        # speed on Ampere+ (silently ignored on ROCm).
         if device.type == "cuda" and dtype is None:
             try:
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -736,7 +752,7 @@ class PrecisionManager:
     @contextmanager
     def autocast(self):
         if self.enabled:
-            with torch.cuda.amp.autocast(dtype=self.autocast_dtype):
+            with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype):
                 yield
         else:
             yield  # FP32 path

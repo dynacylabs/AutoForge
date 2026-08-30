@@ -68,6 +68,7 @@ _DEFAULTS = {
     "pruning_max_swaps": 100,
     "pruning_max_layer": 75,
     "random_seed": 0,
+    "device": None,
     "mps": False,
     "run_name": "",
     "tensorboard": False,
@@ -121,7 +122,9 @@ def run_pipeline(
     settings :
         Arbitrary settings dict merged over defaults (see ``_DEFAULTS``).
     device :
-        Torch device.  When ``None``, auto-detected via ``get_device()``.
+        Torch device.  When ``None``, auto-detected via ``get_device()``
+        (CUDA/ROCm, then Apple Metal, then CPU), honoring a ``device`` entry
+        in ``settings`` or the ``AUTOFORGE_DEVICE`` environment variable.
     preview_callback :
         Called as ``preview_callback(optimizer, num_steps_done)`` periodically.
     cancel_event :

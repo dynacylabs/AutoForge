@@ -6,6 +6,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from autoforge.Helper.DeviceUtils import (
+    describe_device,
+    mps_is_available,
+    resolve_device,
+)
+
 
 def set_seed(args) -> Any:
     random_seed = args.random_seed
@@ -43,12 +49,22 @@ def perform_basic_check(args):
         sys.exit(1)
 
 
-def get_device(args) -> torch.device:
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif args.mps and torch.backends.mps.is_available():
+def get_device(args=None) -> torch.device:
+    """Select the torch device for a run.
+
+    Auto-detects CUDA, ROCm (which PyTorch reports as CUDA) and Apple Metal,
+    falling back to CPU. ``--device``/``AUTOFORGE_DEVICE`` override the choice;
+    the legacy ``--mps`` flag is no longer needed - Metal is picked up on its
+    own - but is still accepted so existing invocations keep working.
+    """
+    device = resolve_device(args=args)
+    if (
+        args is not None
+        and getattr(args, "mps", False)
+        and device.type != "mps"
+        and mps_is_available()
+    ):
+        # Explicit --mps on a machine that also has a CUDA GPU: honor it.
         device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print("Using device:", device)
+    print("Using device:", describe_device(device))
     return device

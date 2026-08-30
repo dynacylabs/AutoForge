@@ -35,6 +35,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+
+from autoforge.Helper.DeviceUtils import synchronize
 # `autoforge.auto_forge` (and its transitive imports, e.g. Optimizer.py) is
 # intentionally imported inside main(), after t0 starts - some of those
 # imports are lazy/conditional on CLI flags (matplotlib, tensorboard), and a
@@ -83,8 +85,10 @@ def main() -> None:
     args = parse_args()
     final_loss = start(args)
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    # Sync before stopping the clock, or an async backend's queued work lands
+    # outside the measurement. (The VRAM instrumentation below stays
+    # NVIDIA-specific on purpose - it polls nvidia-smi.)
+    synchronize()
     elapsed = time.perf_counter() - t0
     stop_event.set()
     if torch.cuda.is_available():

@@ -92,6 +92,7 @@ const defaultSettings: OptimizationSettings = {
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
   random_seed: 0,
+  device: null,
   mps: false,
   run_name: null,
   tensorboard: false,

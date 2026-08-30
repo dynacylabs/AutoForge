@@ -156,7 +156,8 @@ This will generate separate STL files for each color, allowing you to print face
 - `--pruning_max_swaps` Max number of swaps allowed after pruning (default: 100).
 - `--pruning_max_layer` Max number of layers allowed after pruning (default: 75).
 - `--random_seed` Random seed for reproducibility (default: 0 (disabled)).
-- `--mps` Flag to use the Metal Performance Shaders (MPS) backend if available.
+- `--device` Torch device to run on, e.g. `cuda`, `cuda:1`, `mps`, `cpu`. Defaults to auto-detection: CUDA/ROCm first, then Apple Metal (MPS), then CPU. Can also be set with the `AUTOFORGE_DEVICE` environment variable.
+- `--mps` *Deprecated* — Apple Metal is now detected automatically, so this flag is no longer needed. It still works, and forces MPS on a machine that also exposes a CUDA GPU; prefer `--device mps`.
 - `--no-spike-removal` Disable spike removal for the final STL (not recommended).
 
 - `--tensorboard` Flag to enable TensorBoard logging.

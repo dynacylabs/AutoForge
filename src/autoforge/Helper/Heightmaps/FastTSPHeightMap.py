@@ -8,6 +8,7 @@ from scipy.spatial.distance import cdist
 from skimage.color import rgb2lab
 from sklearn.cluster import MiniBatchKMeans
 
+from autoforge.Helper.DeviceUtils import accelerator_device
 from autoforge.Helper.Heightmaps.ChristofidesHeightMap import (
     _compute_distinctiveness,
     segmentation_quality,
@@ -71,31 +72,48 @@ def _refine_clusters(
     kmeans2.fit(centroids1, sample_weight=weights)
     centroids_final = kmeans2.cluster_centers_
 
-    if torch.cuda.is_available():
-        # GPU pixel->centroid assignment: ~4x faster than scipy's cdist for
-        # this problem size (full pixel count x ~max_layers centroids) -
-        # verified to produce identical argmin assignments on synthetic
-        # data. Falls back to the CPU/scipy path below when no CUDA device
-        # is available (e.g. --num_init_rounds > 1 workers on a CPU-only
-        # machine, or MPS/CPU-only runs generally).
-        gpu = torch.device("cuda")
-        pixels_t = torch.as_tensor(pixels, device=gpu, dtype=torch.float32)
-        centroids_t = torch.as_tensor(centroids_final, device=gpu, dtype=torch.float32)
-        labels_final = (
-            torch.argmin(torch.cdist(pixels_t, centroids_t), dim=1)
-            .to(torch.int32)
-            .cpu()
-            .numpy()
-        )
-    else:
-        chunk = 2**18
-        labels_final = np.empty(pixels.shape[0], dtype=np.int32)
-        for start in range(0, pixels.shape[0], chunk):
-            end = start + chunk
-            d = cdist(pixels[start:end], centroids_final, metric="euclidean")
-            labels_final[start:end] = np.argmin(d, axis=1)
-
+    labels_final = _assign_to_centroids(pixels, centroids_final)
     return centroids_final, labels_final.reshape(H, W)
+
+
+def _assign_to_centroids(
+    pixels: np.ndarray, centroids: np.ndarray
+) -> np.ndarray:
+    """Nearest-centroid assignment for every pixel, on the GPU when there is one.
+
+    GPU pixel->centroid assignment is ~4x faster than scipy's cdist at this
+    problem size (full pixel count x ~max_layers centroids) - verified to
+    produce identical argmin assignments on synthetic data. Any accelerator
+    will do, not just CUDA: this is a plain cdist+argmin, so Metal and ROCm
+    run it just as well, and picking the device via ``accelerator_device()``
+    is what stops Apple Silicon from silently taking the slow scipy path.
+
+    Falls back to the chunked CPU path when there is no GPU (e.g.
+    ``--num_init_rounds > 1`` workers on a CPU-only machine) and also when the
+    GPU attempt raises, so a backend missing a ``cdist`` kernel degrades to a
+    slower correct answer instead of failing the run.
+    """
+    gpu = accelerator_device()
+    if gpu is not None:
+        try:
+            pixels_t = torch.as_tensor(pixels, device=gpu, dtype=torch.float32)
+            centroids_t = torch.as_tensor(centroids, device=gpu, dtype=torch.float32)
+            return (
+                torch.argmin(torch.cdist(pixels_t, centroids_t), dim=1)
+                .to(torch.int32)
+                .cpu()
+                .numpy()
+            )
+        except Exception:
+            pass
+
+    chunk = 2**18
+    labels_final = np.empty(pixels.shape[0], dtype=np.int32)
+    for start in range(0, pixels.shape[0], chunk):
+        end = start + chunk
+        d = cdist(pixels[start:end], centroids, metric="euclidean")
+        labels_final[start:end] = np.argmin(d, axis=1)
+    return labels_final
 
 
 def _minimum_spanning_tree_prim(n: int, D: np.ndarray) -> tuple[list[list[tuple[int, float]]], list[int]]:
