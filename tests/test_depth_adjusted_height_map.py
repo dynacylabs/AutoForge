@@ -30,7 +30,7 @@ def two_color_image():
 def _install_fake_transformers(monkeypatch, depth_map: np.ndarray):
     fake_mod = types.ModuleType("transformers")
 
-    def dummy_pipeline(*, task, model):
+    def dummy_pipeline(*, task, model, device=None):
         assert task == "depth-estimation"
         return DummyDepthPipe(depth_map)
 
