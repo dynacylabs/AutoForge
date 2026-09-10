@@ -215,6 +215,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 AutoForge © 2025 by Hendric Voss is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 The software is provided as-is and comes with no warranty or guarantee of support.
 
+The above license applies to the software itself. How you use the generated files and prints is entirely up to you. If you want to print them for your friends or family, that's great. If you want to sell them, that's fine by me too. 
+
+From a licensing standpoint, this means that the prints you create are entirely subject to the MIT License (https://opensource.org/licenses/MIT), and you can do whatever you like with them. The only thing the MIT License does not give you is a warranty, and it also frees me from any liability with regard to your 3D prints. Otherwise, do whatever you like.
+
+I would love to see what you have done with the software, so it would be great if you could send me a link to your work (even if it's just for selling). However, this is not necessary if you do not want to.
 
 ## Acknowledgements
 
