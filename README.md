@@ -2,12 +2,11 @@
 
 AutoForge is a Python tool for generating 3D printed layered models from an input image. Using a learned optimization strategy with a Gumbel softmax formulation, AutoForge assigns materials per layer and produces both a discretized composite image and a 3D-printable STL file. It also generates swap instructions to guide the printer through material changes during a multi-material print. 
 
-**TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work (and without the artistic control).
+**TLDR:** It uses a picture to generate a 3D layer image that you can print with a 3d printer. Similar to [Hueforge](https://shop.thehueforge.com/), but without the manual work.
+
+![2.0_webui.png](images/webui/2.0_webui.png)
 
 
-## You can now run Autoforge for free in your browser thanks to [Huggingface space support](https://huggingface.co/spaces/hvoss-techfak/Autoforge).
-This includes the option to run it locally if you have a powerful pc and don't want to limit yourself to the Huggingface computing limits. \
-For this simply go to the [Huggingface](https://huggingface.co/spaces/hvoss-techfak/Autoforge) space and pull the docker container for this project (upper right corner -> three dots -> "run locally")
 
 ### Persisting job history when running the Docker container yourself
 The web UI keeps a history of past jobs (inputs, results, settings) on disk under `/root/.autoforge/webui_jobs`
@@ -54,9 +53,53 @@ The pruning is set to a maximum of 8 color and 20 swaps, so each image uses at m
 - **Live Visualization**: (Optional) Displays live composite images during the optimization process.
 - **Hueforge export**: Outputs a project file that can be opened with hueforge.
 
-## Manual Installation
+## Web UI: One-Click Install & Run
 
-To install AutoForge, simply install the current version from PyPI:
+
+The easiest way to use AutoForge is the web UI, a local app with drag-and-drop image upload, a filament library, live sliders for adjusting colors after optimization, and pruning. No command-line arguments needed.
+
+1. **Clone this repository** (or download and extract the ZIP from the green "Code" button on GitHub).
+2. **Install**, from the project folder:
+   - Linux/macOS: `./install.sh`
+   - Windows: double-click `install.bat` (or run it from a terminal)
+
+   This installs [`uv`](https://docs.astral.sh/uv/) (a fast Python package manager) if you don't already have it, installs all Python dependencies, and builds the web UI. You'll need [Node.js](https://nodejs.org/) installed for that last step, the installer will tell you if it's missing.
+3. **Run**:
+   - Linux/macOS: `./run_webui.sh`
+   - Windows: double-click `run_webui.bat`
+
+   This starts the server and opens the web UI in your browser automatically (usually at `http://localhost:8000`).
+   It only listens on this computer by default, since the web UI has no login. To open it from other devices on your network, start it with `WEBUI_HOST=0.0.0.0 ./run_webui.sh` (Windows: `set WEBUI_HOST=0.0.0.0` before `run_webui.bat`). Open it by IP address or by this computer's name; any other name (for example one from a reverse proxy) has to be listed in `AUTOFORGE_WEBUI_ALLOWED_HOSTS` (comma separated).
+
+   To make some parts of the picture come out closer than the rest (a face, the eyes, lettering), click **Focus** in the image panel and paint over them; a slider sets how much more they count (2× to 100×, default 10×). After a run, the **Differences** view shows where the print strays furthest from the picture.
+
+   If HueForge is installed on the same computer, the web UI finds your HueForge personal filament library and offers to import it once, on its first start.
+
+   To find a filament you own without measuring it yourself, click **Catalog** in the filament library. It searches every filament on [filamentcolors.xyz](https://filamentcolors.xyz) that has a measured TD (search by brand, color name, type or hex code; filter by type, brand or color family; or pick a color to see the closest matches first), and **Add** puts it straight into your library.
+
+   The web UI sends anonymous usage telemetry to the project via [PostHog](https://posthog.com/) by default, to notify me of problems and any bugs. This includes crash reports (unhandled errors from both the browser frontend and the backend server, with the error type, message, and stack trace) so bugs can get fixed faster. No image data, filament data or other personal information is sent, except that error messages and stack traces can contain file paths (the backend replaces your home folder in them with `~`, so your user name isn't sent from there; the browser's own stack traces only name the app's script files). To disable it, pass `--no-telemetry` (e.g. `./run_webui.sh --no-telemetry` / `run_webui.bat --no-telemetry`), or set `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false` permanently in your environment.
+
+4. **Update to the latest release** whenever you want, from the project folder:
+   - Linux/macOS: `./update.sh`
+   - Windows: double-click `update.bat`
+
+   This checks GitHub for a newer release and, if one exists, pulls it and reinstalls dependencies for you. Add `--check` to only check without applying it (e.g. `./update.sh --check`).
+
+### GPU support
+
+AutoForge runs on NVIDIA GPUs (CUDA), AMD GPUs (ROCm, Linux), Apple Silicon (MPS / Apple Metal) and, more slowly, on the CPU. The device is picked automatically in that order; override it with `--device` or the `AUTOFORGE_DEVICE` environment variable (e.g. `AUTOFORGE_DEVICE=cpu`).
+
+`install.sh` installs the matching PyTorch build for you:
+- **NVIDIA**: the default CUDA build; older (pre-Turing, e.g. GTX 10xx) cards automatically get the CUDA 12.6 build, the last one with kernels for them.
+- **AMD (Linux)**: detected through `/dev/kfd` and given the ROCm build. Consumer Radeon cards that ROCm doesn't officially list may need e.g. `HSA_OVERRIDE_GFX_VERSION=10.3.0` (RX 6000) or `11.0.0` (RX 7000) set when running.
+- **Apple Silicon**: the default macOS build already includes MPS.
+- Anything else: run `AUTOFORGE_TORCH_INDEX=<PyTorch wheel index> ./install.sh`, e.g. `https://download.pytorch.org/whl/cpu`. `./update.sh` keeps whichever build was installed.
+
+If the fused GPU kernels (Triton) cause trouble on your GPU, `AUTOFORGE_TRITON=off` switches to the plain PyTorch code path. For other GPU problems, see the [PyTorch homepage](https://pytorch.org/).
+
+## Manual Installation (CLI only)
+
+If you just want the command-line tool (no web UI), install the current version from PyPI:
 ```bash
    pip install -U autoforge
 ```
@@ -127,7 +170,9 @@ This will generate separate STL files for each color, allowing you to print face
 - `--processing_reduction_factor` Reduction factor for the processing size compared to the output size (default: 2 - half resolution).
 - `--nozzle_diameter` Diameter of the printer nozzle in millimeters (default: 0.4).  
   **Note:** Details smaller than half this value will be ignored.
-- `--early_stopping` Number of steps without improvement before stopping (default: 10000).
+- `--early_stopping` Number of steps without improvement before stopping (default: 3000).
+- `--priority_mask` *(Optional)* Path to a greyscale image the size of the input that marks the parts that matter most: white areas are matched more closely, black areas still count, just less.
+- `--priority_mask_strength` How many times more a white pixel of `--priority_mask` counts than a black one (default: 10; must be at least 1). Raise it if the marked areas still come out off, lower it for a gentler nudge.
 
 - `--flatforge` Enable FlatForge mode to generate separate STL files for each color (default: False).  
   **Note:** FlatForge creates flat prints where each color is its own STL file, allowing face-down printing for smooth, resin-like finishes. Requires a multi-material printer (AMS, MMU, or tool changer).
@@ -145,12 +190,13 @@ This will generate separate STL files for each color, allowing you to print face
 - `--pruning_max_swaps` Max number of swaps allowed after pruning (default: 100).
 - `--pruning_max_layer` Max number of layers allowed after pruning (default: 75).
 - `--random_seed` Random seed for reproducibility (default: 0 (disabled)).
-- `--mps` Flag to use the Metal Performance Shaders (MPS) backend if available.
+- `--device` Torch device to run on, e.g. `cuda`, `cuda:1`, `mps`, `cpu`. Defaults to auto-detection: CUDA/ROCm first, then Apple Metal (MPS), then CPU. Can also be set with the `AUTOFORGE_DEVICE` environment variable.
+- `--mps` *Deprecated* — Apple Metal is now detected automatically, so this flag is no longer needed. It still works, and forces MPS on a machine that also exposes a CUDA GPU; prefer `--device mps`.
 - `--no-spike-removal` Disable spike removal for the final STL (not recommended).
 
 - `--tensorboard` Flag to enable TensorBoard logging.
 - `--run_name` *(Optional)* Name of the run used for TensorBoard logging.
-- `--num_init_rounds` Number of rounds to choose the starting height map from (default: 128).
+- `--num_init_rounds` Number of rounds to choose the starting height map from (default: 1 - extra rounds are currently deterministic and don't add variety, so they only cost startup time).
 - `--num_init_cluster_layers` Number of layers to cluster the image into (default: -1).
 - `--disable_visualization_for_gradio` Simple switch to disable the matplotlib render window for gradio rendering (default: 0).
 - `--best_of` Run the entire program multiple times and output the best result (default: 1)
@@ -174,6 +220,97 @@ After running, the following files will be created in your specified output fold
   
   *Note:* FlatForge generates multiple STL files that align perfectly when loaded together in your slicer, creating a solid rectangular print with each color as a separate object.
 
+## Docker
+
+The repository includes a Docker setup that builds the web UI, starts it automatically and serves it on http://localhost:8000. There is one compose file per kind of hardware; the first build takes a while, since it downloads PyTorch.
+
+| Hardware | Compose file | Image |
+| --- | --- | --- |
+| NVIDIA GPU (Linux, Windows) | `docker-compose.yml` | `autoforge-webui:latest` |
+| AMD GPU (Linux, x86_64) | `docker-compose.rocm.yml` | `autoforge-webui:rocm` |
+| CPU only, and macOS (Intel and Apple Silicon) | `docker-compose.cpu.yml` | `autoforge-webui:cpu` |
+
+Docker Compose 2.24 or newer is required. To check which device the running web UI uses, open http://localhost:8000/api/system/device: it lists `cuda:0` (NVIDIA and AMD alike) when the GPU is visible inside the container, or only `cpu` when it is not.
+
+### NVIDIA
+
+1. Install the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), then restart Docker. On Windows, Docker Desktop with the WSL 2 backend already includes GPU support; only the NVIDIA driver is needed.
+2. Start AutoForge:
+   ```bash
+   docker compose up -d --build
+   ```
+
+Older cards (GTX 10xx and other pre-Turing GPUs) need the CUDA 12.6 build of PyTorch, since the default build no longer has kernels for them:
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 docker compose up -d --build
+```
+
+### AMD
+
+1. Linux only. The host needs the `amdgpu` kernel driver (included in current kernels); `/dev/kfd` must exist. The ROCm runtime itself ships inside the image, so ROCm does not need to be installed on the host.
+2. Start AutoForge:
+   ```bash
+   docker compose -f docker-compose.rocm.yml up -d --build
+   ```
+
+Consumer Radeon cards that ROCm doesn't officially list often need a GFX version override. Uncomment the `environment` block in `docker-compose.rocm.yml` and set `HSA_OVERRIDE_GFX_VERSION` to `10.3.0` for RDNA2 (RX 6000) or `11.0.0` for RDNA3 (RX 7000), then run the command again. If optimization fails with a Triton compilation error, add `AUTOFORGE_TRITON: "off"` to the same block to use the plain PyTorch code path.
+
+AMD GPUs aren't supported by Docker on Windows or macOS; use the CPU image there.
+
+### Apple Silicon (MPS)
+
+Docker containers on macOS run in a Linux VM with no access to Apple Metal, so the GPU cannot be used from Docker on a Mac. You have two options:
+- **Use the GPU:** install AutoForge natively with `./install.sh` and start it with `./run_webui.sh`. The macOS build of PyTorch includes MPS, and AutoForge picks it automatically.
+- **Use Docker (CPU only):**
+  ```bash
+  docker compose -f docker-compose.cpu.yml up -d --build
+  ```
+  This builds a native arm64 image. In Docker Desktop, raise the memory limit (Settings → Resources) if large images fail with out-of-memory errors.
+
+### CPU only
+
+Works on any machine with Docker, but optimization is much slower than on a GPU:
+```bash
+docker compose -f docker-compose.cpu.yml up -d --build
+```
+
+### Everyday use
+
+The commands below use the NVIDIA compose file; add `-f docker-compose.rocm.yml` or `-f docker-compose.cpu.yml` for the other images.
+
+| Task | Command |
+| --- | --- |
+| Show the logs | `docker compose logs -f` |
+| Stop | `docker compose down` |
+| Update to a newer version | `git pull && docker compose up -d --build` |
+| Use another port | `WEBUI_PORT=9000 docker compose up -d` |
+| Disable telemetry | `AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false docker compose up -d` |
+
+All the images start a container named `autoforge`, so stop the running one with its own compose file before switching to another.
+
+Your projects, uploaded images, filament library and downloaded models are kept in the `autoforge-data` Docker volume, which survives restarts, updates and switching between the images. `docker compose down -v` deletes it along with the container.
+
+To use your HueForge filament library, uncomment the HueForge lines in `docker-compose.yml` (the `AUTOFORGE_WEBUI_HUEFORGE_LIBRARY` variable and the volume mount) and point the mount at the folder containing `personal_library.json`.
+
+### Command-line tool
+
+The `autoforge` CLI is included in every image. Mount the folder with your image and filament CSV into the container and run it from there; results are written into that folder:
+```bash
+# NVIDIA
+docker run --rm --gpus all -v "$PWD:/work" -w /work autoforge-webui:latest \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+
+# AMD
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+    -v "$PWD:/work" -w /work autoforge-webui:rocm \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+
+# CPU / macOS
+docker run --rm -v "$PWD:/work" -w /work autoforge-webui:cpu \
+    autoforge --input_image input.jpg --csv_file materials.csv --output_folder output
+```
+The container runs as root, so on Linux the output files belong to root; `sudo chown -R "$USER" output` makes them yours again.
+
 ## Development
 
 To have a "nightly" version of the repository or have live updating changes during development please do the following: 
@@ -185,6 +322,8 @@ conda create -n forge python=3.11
 conda activate forge
 pip install -e .
 ```
+
+To refresh the bundled filamentcolors.xyz catalog (`src/autoforge/data/filamentcolors_catalog.json`) before a release, run `./generate_filamentcolors_library.sh`. It downloads the whole catalog once, pausing 2 seconds between pages (`--delay` sets the pause; requests are never less than 1 second apart), and keeps only the filaments that have a TD.
 
 If the installed pytorch version has no cuda support execute the following:
 
@@ -203,12 +342,18 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 AutoForge © 2025 by Hendric Voss is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 The software is provided as-is and comes with no warranty or guarantee of support.
 
+The above license applies to the software itself. How you use the generated files and prints is entirely up to you. If you want to print them for your friends or family, that's great. If you want to sell them, that's fine by me too. 
+
+From a licensing standpoint, this means that the prints you create are entirely subject to the [MIT License](https://opensource.org/licenses/MIT), and you can do whatever you like with them. The only thing the MIT License does not give you is a warranty, and it also frees me from any liability with regard to your 3D prints. Otherwise, do whatever you like.
+
+I would love to see what you have done with the software, so it would be great if you could send me a link to your work (even if it's just for selling). However, this is not necessary if you do not want to.
 
 ## Acknowledgements
 
 First and foremost:
 - [Hueforge](https://shop.thehueforge.com/) for providing the inspiration for this project.
 Without it, this project would not have been possible.
+- [filamentcolors.xyz](https://filamentcolors.xyz) and its community for the measured filament swatches and TD values in the web UI's filament catalog.
 
 AutoForge makes use of several open source libraries:
 

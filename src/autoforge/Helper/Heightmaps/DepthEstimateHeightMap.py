@@ -8,6 +8,8 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import silhouette_score
 from sklearn.utils._testing import ignore_warnings
 
+from autoforge.Helper.DeviceUtils import accelerator_device
+
 
 def initialize_pixel_height_logits(target):
     """
@@ -97,10 +99,25 @@ def init_height_map_depth_color_adjusted(
 
     target_uint8 = target.astype(np.uint8)
     image_pil = Image.fromarray(target_uint8)
-    pipe = pipeline(
-        task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf"
-    )
-    depth_result = pipe(image_pil)
+    # Run the depth model on whatever accelerator is present. transformers
+    # defaults to CPU, which left this init several times slower than it needs
+    # to be on every GPU, Apple Silicon included. A backend that chokes on the
+    # model falls back to CPU rather than failing the run.
+    accel = accelerator_device()
+    try:
+        pipe = pipeline(
+            task="depth-estimation",
+            model="depth-anything/Depth-Anything-V2-Small-hf",
+            device=accel,
+        )
+        depth_result = pipe(image_pil)
+    except Exception:
+        if accel is None:
+            raise
+        pipe = pipeline(
+            task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf"
+        )
+        depth_result = pipe(image_pil)
     depth_map = depth_result["depth"]
     if hasattr(depth_map, "convert"):
         depth_map = np.array(depth_map)
@@ -126,7 +143,8 @@ def init_height_map_depth_color_adjusted(
     H, W, _ = target.shape
     pixels = target.reshape(-1, 3).astype(np.float32)
 
-    optimal_n = max_layers  # // 2
+    # sklearn refuses more clusters than samples (a tiny or 1-pixel image).
+    optimal_n = max(1, min(max_layers, pixels.shape[0]))
     # ---------------------------
     # Step 3: Perform color clustering on the full image
     # ---------------------------
@@ -159,15 +177,12 @@ def init_height_map_depth_color_adjusted(
                 inds = indices[sub_mask]
                 if inds.size == 0:
                     continue
-                for i, j in inds:
-                    final_labels[i, j] = new_cluster_id
+                final_labels[inds[:, 0], inds[:, 1]] = new_cluster_id
                 sub_avg_depth = np.mean(depth_norm[mask][split_labels == split])
                 cluster_info[new_cluster_id] = sub_avg_depth
                 new_cluster_id += 1
         else:
-            indices = np.argwhere(mask)
-            for i, j in indices:
-                final_labels[i, j] = new_cluster_id
+            final_labels[mask] = new_cluster_id
             cluster_info[new_cluster_id] = avg_depth
             new_cluster_id += 1
 
@@ -290,9 +305,11 @@ def init_height_map_depth_color_adjusted(
     # ---------------------------
     # Step 11: Create new normalized label image and convert to logits.
     # ---------------------------
-    new_labels = np.vectorize(lambda x: final_mapping[x])(final_labels).astype(
-        np.float32
-    )
+    # A lookup array instead of a Python call per pixel.
+    lookup = np.zeros(int(final_labels.max()) + 1, dtype=np.float32)
+    for cid, value in final_mapping.items():
+        lookup[cid] = value
+    new_labels = lookup[final_labels]
     if new_labels.max() > 0:
         new_labels = new_labels / new_labels.max()
     if focus_map is not None:
@@ -309,7 +326,10 @@ def init_height_map_depth_color_adjusted(
             fm = fm[np.ix_(iy, ix)]
         new_labels = np.clip(new_labels * (1.0 + focus_boost * fm), 0.0, 1.0)
     pixel_height_logits = np.log((new_labels + eps) / (1 - new_labels + eps))
-    return pixel_height_logits, final_labels.astype(np.int32)
+    from autoforge.Helper.Heightmaps.FastTSPHeightMap import background_first_labels
+
+    # Label 0 is the background to the optimizer: the lowest cluster.
+    return pixel_height_logits, background_first_labels(final_labels, final_order[0][0]).astype(np.int32)
 
 
 def tsp_simulated_annealing(

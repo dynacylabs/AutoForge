@@ -8,7 +8,47 @@ import numpy as np
 
 
 def imread(filename: str, flags: int = cv2.IMREAD_COLOR) -> MatLike:
-    return cv2.imdecode(np.fromfile(filename, dtype=np.uint8), flags)
+    data = np.fromfile(filename, dtype=np.uint8)
+    img = cv2.imdecode(data, flags)
+    if img is not None and flags == cv2.IMREAD_UNCHANGED:
+        # IMREAD_UNCHANGED (needed for alpha / 16 bit) makes OpenCV ignore the
+        # EXIF orientation, unlike IMREAD_COLOR and every image viewer: a
+        # phone photo taken upright was processed lying on its side.
+        img = apply_exif_orientation(img, exif_orientation(data.tobytes()))
+    return img
+
+
+def exif_orientation(data: bytes) -> int:
+    """The EXIF orientation tag (1-8) of an encoded image, 1 if absent."""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            value = int(im.getexif().get(0x0112, 1))
+    except Exception:
+        return 1
+    return value if 1 <= value <= 8 else 1
+
+
+def apply_exif_orientation(img: np.ndarray, orientation: int) -> np.ndarray:
+    """``img`` [H,W(,C)] as it is displayed for EXIF ``orientation`` (1-8)."""
+    if orientation == 2:
+        img = img[:, ::-1]
+    elif orientation == 3:
+        img = img[::-1, ::-1]
+    elif orientation == 4:
+        img = img[::-1]
+    elif orientation == 5:
+        img = np.swapaxes(img, 0, 1)
+    elif orientation == 6:
+        img = np.rot90(img, k=-1)
+    elif orientation == 7:
+        img = np.rot90(np.swapaxes(img, 0, 1), k=2)
+    elif orientation == 8:
+        img = np.rot90(img, k=1)
+    return np.ascontiguousarray(img)
 
 
 def imwrite(filename: str, img: MatLike, params: Sequence[int] = ()) -> None:
@@ -16,6 +56,45 @@ def imwrite(filename: str, img: MatLike, params: Sequence[int] = ()) -> None:
     if not success:
         raise OSError(f"cv2 could not write to path {filename}")
     encoded_img.tofile(filename)
+
+
+def to_bgr_or_bgra_uint8(img) -> np.ndarray:
+    """Bring any image OpenCV decodes into the 8-bit BGR/BGRA layout the
+    pipeline is written for (used by both the CLI and the webui).
+
+    ``cv2.imread(..., IMREAD_UNCHANGED)`` returns whatever the file holds, but
+    the pipeline indexed ``img.shape[2]`` and treated values as 0-255: a
+    grayscale PNG/JPEG (2-D array) failed with "tuple index out of range",
+    grayscale+alpha had two channels and failed in ``cvtColor``, and a
+    16-bit PNG ran on values up to 65535 — a nonsense target the optimizer
+    could never match."""
+    if img is None:
+        raise ValueError("The input image could not be read.")
+    if img.dtype == np.uint16:
+        img = (img.astype(np.float32) / 257.0).round().astype(np.uint8)
+    elif img.dtype in (np.float32, np.float64):
+        img = (np.clip(img, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    channels = img.shape[2]
+    if channels == 1:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if channels == 2:
+        gray, alpha = img[:, :, 0], img[:, :, 1:2]
+        return np.concatenate([cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), alpha], axis=2)
+    return img
+
+
+def image_to_uint8(img) -> np.ndarray:
+    """A 0-255 float image (tensor or array) as uint8, clipped first: a plain
+    cast wraps around, so a composite value of 256 (bf16 steps by 1 near
+    white) became 0 - a black pixel - and a slightly negative one ~255.
+    Values are truncated as before, only clamped into range."""
+    if isinstance(img, torch.Tensor):
+        img = img.detach().float().cpu().numpy()
+    return np.clip(np.asarray(img, dtype=np.float32), 0, 255).astype(np.uint8)
 
 
 def resize_image(img, max_size):
@@ -28,8 +107,10 @@ def resize_image(img, max_size):
         scale = max_size / h_img
 
     # Compute new dimensions and round them
-    new_w = int(round(w_img * scale))
-    new_h = int(round(h_img * scale))
+    # At least 1 px: a very long, thin image rounded its short side to 0
+    # and cv2.resize failed.
+    new_w = max(1, int(round(w_img * scale)))
+    new_h = max(1, int(round(h_img * scale)))
 
     # Resize the image with an appropriate interpolation method
     img_out = cv2.resize(img, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -45,6 +126,39 @@ def resize_image_exact(img, new_w, new_h):
     # As we shrink the image, we lose information and the image becomes blurry with INTER_AREA. This is detrimental for the solver. If you want to try it out be my guest.
     # INTER_AREA actually destroys a lot of the colors of our solver.
     return img_out
+
+
+# sRGB -> Lab conversion constants, cached per (device, dtype) so we don't
+# rebuild + host->device transfer these small tensors on every call (this
+# function runs at least twice per optimization step).
+_RGB_TO_XYZ_CACHE: dict = {}
+_WHITE_POINT_CACHE: dict = {}
+
+
+def _get_rgb_to_xyz(dtype, device):
+    key = (dtype, device)
+    t = _RGB_TO_XYZ_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(
+            [
+                [0.4124564, 0.3575761, 0.1804375],
+                [0.2126729, 0.7151522, 0.0721750],
+                [0.0193339, 0.1191920, 0.9503041],
+            ],
+            dtype=dtype,
+            device=device,
+        )
+        _RGB_TO_XYZ_CACHE[key] = t
+    return t
+
+
+def _get_white_point(dtype, device):
+    key = (dtype, device)
+    t = _WHITE_POINT_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([0.95047, 1.0, 1.08883], dtype=dtype, device=device)
+        _WHITE_POINT_CACHE[key] = t
+    return t
 
 
 def srgb_to_lab(srgb, eps=1e-6):
@@ -72,15 +186,7 @@ def srgb_to_lab(srgb, eps=1e-6):
     )
 
     # sRGB to XYZ conversion matrix (D65 illuminant)
-    rgb_to_xyz = torch.tensor(
-        [
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041],
-        ],
-        dtype=srgb.dtype,
-        device=srgb.device,
-    )
+    rgb_to_xyz = _get_rgb_to_xyz(srgb.dtype, srgb.device)
 
     # Reshape for matrix multiplication if needed.
     orig_shape = srgb_linear.shape
@@ -89,9 +195,7 @@ def srgb_to_lab(srgb, eps=1e-6):
     xyz = xyz.view(orig_shape)
 
     # Normalize XYZ by the D65 white point.
-    white_point = torch.tensor(
-        [0.95047, 1.0, 1.08883], dtype=srgb.dtype, device=srgb.device
-    )
+    white_point = _get_white_point(srgb.dtype, srgb.device)
     xyz_scaled = xyz / white_point
 
     # Define the piecewise function f(t) used in the Lab conversion.

@@ -20,7 +20,7 @@ Output:
     A 8-bit grayscale PNG (0..255). During optimization this will be normalized to 0..1.
     White (255) -> full priority, Black (0) -> low priority.
 
-If --output is omitted, the mask will be saved next to the input as <input>_mask.<ext>.
+If --output is omitted, the mask will be saved next to the input as <input>_mask.png.
 
 You can create soft gradients by enabling gradient mode (g), which applies a
 cosine falloff from the center of the brush.
@@ -31,6 +31,10 @@ import os
 import cv2
 import numpy as np
 
+# The ImageHelper wrappers: OpenCV's own file I/O can't open non-ASCII
+# paths on Windows.
+from autoforge.Helper.ImageHelper import imread, imwrite
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -38,7 +42,7 @@ def parse_args():
     p.add_argument(
         "--output",
         default="",
-        help="Path to save the priority mask (optional). If omitted, saves as <input>_mask.<ext>",
+        help="Path to save the priority mask (optional). If omitted, saves as <input>_mask.png",
     )
     p.add_argument(
         "--initial", default="", help="Optional existing mask to load and edit"
@@ -71,10 +75,15 @@ class PriorityMaskEditor:
 
     def _apply_brush(self, x, y, erase=False):
         rr = self.brush_radius
-        x0 = max(0, x - rr)
-        x1 = min(self.w, x + rr + 1)
-        y0 = max(0, y - rr)
-        y1 = min(self.h, y + rr + 1)
+        # A drag leaving the window reports coordinates outside the image:
+        # keep the window valid (x1 >= x0), or a negative end index sliced a
+        # different region than the brush grid and the callback raised.
+        x0 = min(max(0, x - rr), self.w)
+        x1 = max(x0, min(self.w, x + rr + 1))
+        y0 = min(max(0, y - rr), self.h)
+        y1 = max(y0, min(self.h, y + rr + 1))
+        if x1 == x0 or y1 == y0:
+            return
         patch = self.mask[y0:y1, x0:x1]
         yy, xx = np.ogrid[y0:y1, x0:x1]
         dist = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
@@ -138,23 +147,22 @@ class PriorityMaskEditor:
 
 
 def _default_output_path(input_path: str) -> str:
-    root, ext = os.path.splitext(input_path)
-    # Fallback to .png if no extension
-    if ext == "":
-        ext = ".png"
-    return f"{root}_mask{ext}"
+    # Always PNG: a mask next to a .jpg input was saved as a lossy JPEG,
+    # whose compression noise then weighted the loss.
+    root, _ext = os.path.splitext(input_path)
+    return f"{root}_mask.png"
 
 
 def main():
     args = parse_args()
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input image '{args.input}' not found")
-    ref = cv2.imread(args.input, cv2.IMREAD_COLOR)
+    ref = imread(args.input, cv2.IMREAD_COLOR)
     if ref is None:
         raise RuntimeError("Failed to load input image.")
     init_mask = None
     if args.initial and os.path.exists(args.initial):
-        init_mask = cv2.imread(args.initial, cv2.IMREAD_GRAYSCALE)
+        init_mask = imread(args.initial, cv2.IMREAD_GRAYSCALE)
 
     editor = PriorityMaskEditor(
         ref, init_mask, brush_radius=args.brush, alpha=args.alpha
@@ -173,11 +181,11 @@ def main():
         cv2.imshow(win_name, overlay)
         key = cv2.waitKey(16) & 0xFF
         if key in (ord("q"), 27):  # q or ESC
-            cv2.imwrite(out_path, editor.get_mask_uint8())
+            imwrite(out_path, editor.get_mask_uint8())
             print(f"Saved mask to {out_path}")
             break
         elif key == ord("s"):
-            cv2.imwrite(out_path, editor.get_mask_uint8())
+            imwrite(out_path, editor.get_mask_uint8())
             print(f"Saved mask to {out_path}")
         elif key == ord("+") or key == ord("="):
             editor.brush_radius = min(editor.brush_radius + 5, 1000)

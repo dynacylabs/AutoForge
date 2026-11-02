@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 import time
 from typing import Any
@@ -6,19 +7,34 @@ from typing import Any
 import numpy as np
 import torch
 
+from autoforge.Helper.DeviceUtils import (
+    activate_device,
+    describe_device,
+    mps_is_available,
+    resolve_device,
+)
+
 
 def set_seed(args) -> Any:
     random_seed = args.random_seed
     if random_seed == 0:
         random_seed = int(time.time() * 1000) % 1000000
+    # Python's own RNG too: the depth initializer's ordering search draws
+    # from it, so --random_seed did not make that run reproducible.
+    random.seed(random_seed)
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
     return random_seed
 
 
 def perform_basic_check(args):
-    # Basic checks
-    if not (args.background_height / args.layer_height).is_integer():
+    if not args.layer_height > 0:
+        print("Error: --layer_height must be greater than 0.", file=sys.stderr)
+        sys.exit(1)
+    # Basic checks. With a tolerance: in floating point 0.28 / 0.04 is
+    # 7.000000000000001, so an exact is_integer() rejected valid settings.
+    ratio = args.background_height / args.layer_height
+    if abs(ratio - round(ratio)) > 1e-6:
         print(
             "Error: Background height must be a multiple of layer height.",
             file=sys.stderr,
@@ -41,14 +57,28 @@ def perform_basic_check(args):
             file=sys.stderr,
         )
         sys.exit(1)
+    if getattr(args, "priority_mask_strength", 10.0) < 1:
+        print("Error: --priority_mask_strength must be at least 1.", file=sys.stderr)
+        sys.exit(1)
 
 
-def get_device(args) -> torch.device:
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif args.mps and torch.backends.mps.is_available():
+def get_device(args=None) -> torch.device:
+    """Select the torch device for a run.
+
+    Auto-detects CUDA, ROCm (which PyTorch reports as CUDA) and Apple Metal,
+    falling back to CPU. ``--device``/``AUTOFORGE_DEVICE`` override the choice;
+    the legacy ``--mps`` flag is no longer needed - Metal is picked up on its
+    own - but is still accepted so existing invocations keep working.
+    """
+    device = resolve_device(args=args)
+    if (
+        args is not None
+        and getattr(args, "mps", False)
+        and device.type != "mps"
+        and mps_is_available()
+    ):
+        # Explicit --mps on a machine that also has a CUDA GPU: honor it.
         device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print("Using device:", device)
+    activate_device(device)
+    print("Using device:", describe_device(device))
     return device

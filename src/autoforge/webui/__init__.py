@@ -1,1 +1,1 @@
-# AutoForge Web UI
+from .server import create_app

@@ -1,0 +1,216 @@
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
+from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+import torch
+
+from autoforge.Helper.DeviceUtils import (
+    backend_of,
+    cuda_is_available,
+    describe_device,
+    is_rocm,
+    mps_is_available,
+    resolve_device,
+)
+from fastapi import APIRouter
+
+from ..config import config
+from ..helpers.telemetry import anon_distinct_id
+
+router = APIRouter()
+
+_GITHUB_REPO = "hvoss-techfak/AutoForge"
+_UPDATE_CACHE_TTL = 3600  # seconds — avoid hitting GitHub's API on every page load
+_UPDATE_ERROR_TTL = 300
+_update_cache: dict = {"checked_at": 0.0, "data": None}
+
+
+_PYPROJECT_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "pyproject.toml")
+)
+
+
+def _version_from_pyproject() -> str | None:
+    """Read [project].version straight out of pyproject.toml, when running
+    from a source checkout (the webui's normal deployment — see
+    run_webui.sh/Dockerfile.webui). This is what makes a version bump show
+    up immediately without reinstalling the package: pip's installed
+    dist-info metadata (the importlib.metadata fallback below) is a
+    snapshot taken at install time and silently goes stale otherwise — the
+    frontend's version badge used to be a hand-edited literal that drifted
+    just the same way, out of sync with both this file and pyproject.toml."""
+    try:
+        with open(_PYPROJECT_PATH, "rb") as f:
+            try:
+                import tomllib
+                data = tomllib.load(f)
+            except ModuleNotFoundError:
+                # Python 3.10 has no stdlib tomllib; pyproject.toml's
+                # [project] table is simple enough that a targeted regex
+                # avoids adding a tomli dependency just for this.
+                f.seek(0)
+                text = f.read().decode("utf-8")
+                match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+                return match.group(1) if match else None
+        version = data.get("project", {}).get("version")
+        return str(version) if version else None
+    except Exception:
+        return None
+
+
+def _current_version() -> str:
+    from_pyproject = _version_from_pyproject()
+    if from_pyproject:
+        return from_pyproject
+    for name in ("autoforge", "AutoForge"):
+        try:
+            return pkg_version(name)
+        except PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+def _parse_version(v: str) -> tuple[tuple[int, ...], str]:
+    """(release numbers, pre-release/local suffix): "2.2.0-beta.1" ->
+    ((2, 2, 0), "-beta.1"). Stripping the non-digits of every dot segment
+    instead read that as (2, 2, 0, 1) - newer than the 2.2.0 release."""
+    match = re.match(r"^\s*v?(\d+(?:\.\d+)*)(.*)$", v)
+    if not match:
+        return (0,), v
+    release = tuple(int(p) for p in match.group(1).split("."))
+    # Trailing zeros don't make a version newer: 2.1 == 2.1.0.
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    return release, match.group(2).strip()
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    """Whether ``latest`` is a newer *release* than ``current``. A
+    pre-release tag never counts as an update."""
+    latest_rel, latest_suffix = _parse_version(latest)
+    current_rel, current_suffix = _parse_version(current)
+    if latest_suffix:
+        return False
+    if latest_rel != current_rel:
+        return latest_rel > current_rel
+    # The same numbers: the release is newer than a pre-release of it.
+    return bool(current_suffix)
+
+
+@router.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
+@router.get("/version")
+async def get_version():
+    return {"version": _current_version(), "repo": _GITHUB_REPO}
+
+
+def _check_latest_release() -> dict:
+    """The (blocking) GitHub API call. Runs in a worker thread via
+    ``asyncio.to_thread`` — doing it inline in the async handler stalled the
+    whole event loop (every other request and websocket, including live job
+    progress) for up to the 5 s urlopen timeout on the first page load."""
+    current = _current_version()
+    result = {
+        "current_version": current,
+        "latest_version": None,
+        "update_available": False,
+        "release_url": f"https://github.com/{_GITHUB_REPO}/releases/latest",
+        "error": None,
+    }
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "AutoForge-WebUI"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest_tag = str(data.get("tag_name", "")).lstrip("v")
+        result["latest_version"] = latest_tag or None
+        result["release_url"] = data.get("html_url", result["release_url"])
+        if latest_tag and current != "unknown":
+            result["update_available"] = _is_newer(latest_tag, current)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+        result["error"] = str(e)
+    return result
+
+
+@router.get("/update-check")
+async def check_for_update():
+    """Best-effort check against GitHub's latest-release API. Never raises —
+    a network hiccup or rate limit just means no update badge, not a broken
+    page. Cached briefly so repeated page loads don't hammer the API."""
+    import asyncio
+
+    now = time.time()
+    cached = _update_cache["data"]
+    # A failed check (offline, rate limit) is retried after a few minutes,
+    # not kept for the full hour.
+    ttl = _UPDATE_ERROR_TTL if cached is not None and cached.get("error") else _UPDATE_CACHE_TTL
+    if cached is not None and (now - _update_cache["checked_at"]) < ttl:
+        return cached
+
+    result = await asyncio.to_thread(_check_latest_release)
+
+    _update_cache["data"] = result
+    _update_cache["checked_at"] = now
+    return result
+
+
+@router.get("/info")
+async def system_info():
+    device = resolve_device()
+    cuda_available = cuda_is_available()
+    mps_available = mps_is_available()
+    return {
+        "torchVersion": torch.__version__,
+        # PyTorch reports AMD GPUs through the CUDA API, so `cudaAvailable`
+        # stays True on ROCm (existing clients depend on that); `backend`
+        # is what actually distinguishes the two.
+        "cudaAvailable": cuda_available,
+        "mpsAvailable": mps_available,
+        "rocmAvailable": cuda_available and is_rocm(),
+        "backend": backend_of(device),
+        "device": str(device),
+        "deviceDescription": describe_device(device),
+    }
+
+
+@router.get("/telemetry")
+async def telemetry_config():
+    """Tells the frontend whether/how to initialize PostHog. Disabled
+    server-side (via --no-telemetry / AUTOFORGE_WEBUI_TELEMETRY_ENABLED=false)
+    or with no project key configured, the frontend never loads PostHog at
+    all — not just a suppressed capture call.
+
+    ``distinctId`` is the same anonymous per-install id the backend uses for
+    its own capture_exception() calls (helpers/telemetry.py). The frontend
+    calls posthog.identify() with it so a page ping and a backend exception
+    from the same install group under one PostHog person instead of two
+    unrelated anonymous ids."""
+    enabled = config.telemetry_enabled and bool(config.posthog_key)
+    return {
+        "enabled": enabled,
+        "apiKey": config.posthog_key if enabled else None,
+        "host": config.posthog_host if enabled else None,
+        "distinctId": anon_distinct_id() if enabled else None,
+    }
+
+
+@router.get("/device")
+async def available_devices():
+    """Every device the user could select, most capable first."""
+    devices = []
+    if cuda_is_available():
+        for i in range(torch.cuda.device_count()):
+            devices.append(f"cuda:{i}")
+    if mps_is_available():
+        devices.append("mps")
+    devices.append("cpu")
+    return {"devices": devices, "default": str(resolve_device())}

@@ -1,0 +1,169 @@
+import json
+import asyncio
+import logging
+import threading
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from ..services.optimization_service import get_optimization_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Track active preview WebSocket connections
+_preview_connections: set[WebSocket] = set()
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+# Per connection, the newest preview not yet handed to the socket. A slow
+# client used to get one queued send per preview (each a full base64 PNG),
+# piling up without bound; now a newer preview replaces an unsent one.
+_pending: dict[WebSocket, str] = {}
+_pending_lock = threading.Lock()
+
+
+async def _send_latest(ws: WebSocket) -> None:
+    with _pending_lock:
+        msg = _pending.pop(ws, None)
+    if msg is not None:
+        await ws.send_text(msg)
+
+
+def _send_to_all(msg: str):
+    """Safely send a message to all connected preview clients (thread-safe)."""
+    # Iterate a copy: this runs on the optimizer's worker thread while the
+    # event loop adds/discards connections, and iterating the live set then
+    # raises "Set changed size during iteration", dropping the update.
+    for ws in list(_preview_connections):
+        try:
+            if _main_loop and not _main_loop.is_closed():
+                with _pending_lock:
+                    already_queued = ws in _pending
+                    _pending[ws] = msg
+                if already_queued:
+                    # The send scheduled for the older message takes this one.
+                    continue
+                future = asyncio.run_coroutine_threadsafe(_send_latest(ws), _main_loop)
+                # run_coroutine_threadsafe only schedules the coroutine — it
+                # returns immediately, so the try/except around it can never
+                # observe a failed send() (that happens later, on the event
+                # loop). Without this callback, a client that vanished
+                # without a clean close (network drop, tab killed) was never
+                # pruned from _preview_connections by this path: every future
+                # broadcast kept scheduling a doomed send to it forever.
+                future.add_done_callback(lambda f, ws=ws: _drop_on_failure(f, ws))
+        except Exception:
+            _preview_connections.discard(ws)
+
+
+def _drop_on_failure(future: "asyncio.Future", ws: WebSocket) -> None:
+    """Runs on the event-loop thread (add_done_callback's contract), so
+    mutating the set directly here is safe."""
+    if future.cancelled() or future.exception() is not None:
+        _preview_connections.discard(ws)
+        with _pending_lock:
+            _pending.pop(ws, None)
+
+
+def encode_png_b64(img) -> str:
+    """An RGB 0-255 float image (tensor or array) as the base64 PNG the
+    previews carry, clamped to 0-255 (see image_to_uint8)."""
+    import base64
+
+    import cv2
+
+    from autoforge.Helper.ImageHelper import image_to_uint8
+
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(image_to_uint8(img), cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise ValueError("PNG encoding failed")
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+def broadcast_preview(
+    image_data: str,
+    job_id: str,
+    sliders: list | None = None,
+    iteration: int = 0,
+    loss: float | None = None,
+    min_layer: int | None = None,
+    max_layer: int | None = None,
+    render_id: str | None = None,
+    base: dict | None = None,
+    live_mesh: dict | None = None,
+):
+    """Send a preview update to all connected preview clients (thread-safe).
+
+    Every connected browser tab shares this one channel, so `job_id` lets a
+    client that isn't watching this job (a different tab, or a page loaded
+    after this job started) ignore the update instead of silently picking up
+    an unrelated job's colors/progress.
+    """
+    payload = {
+        "type": "preview_update",
+        "job_id": job_id,
+        "image": image_data,
+        "sliders": sliders or [],
+        "iteration": iteration,
+        "loss": loss,
+    }
+    if min_layer is not None:
+        payload["min_layer"] = min_layer
+    if max_layer is not None:
+        payload["max_layer"] = max_layer
+    if render_id:
+        payload["render_id"] = str(render_id)
+    if base:
+        # The base the optimizer currently uses (it chooses the base
+        # filament too), so the base row follows the live preview.
+        payload["base"] = base
+    if live_mesh:
+        # Mid-prune: the mesh of the solution as it stands now
+        # ({"prune_job_id", "url"}), shown in place of `job_id`'s own
+        # until that prune ends.
+        payload["live_mesh"] = live_mesh
+    _send_to_all(json.dumps(payload))
+
+
+@router.websocket("/ws/optimize/{job_id}")
+async def ws_optimize(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    svc = get_optimization_service()
+    sent_terminal = False
+    try:
+        while True:
+            job = svc.get_job(job_id)
+            if not job:
+                await websocket.send_json({"job_id": job_id, "status": "not_found", "error": "Job not found"})
+                break
+            # The base64 preview PNG rides only on /ws/preview, not here:
+            # this socket polls every 0.5 s for every connected client.
+            payload = job.model_dump()
+            payload.pop("preview_image", None)
+            await websocket.send_json(payload)
+            if job.status in ("completed", "failed", "cancelled"):
+                sent_terminal = True
+                break
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # A send on a socket the client already dropped (no clean close).
+        if not sent_terminal:
+            logger.debug("Job status socket for %s closed", job_id, exc_info=True)
+
+
+@router.websocket("/ws/preview")
+async def ws_preview(websocket: WebSocket):
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
+    await websocket.accept()
+    _preview_connections.add(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _preview_connections.discard(websocket)
+        with _pending_lock:
+            _pending.pop(websocket, None)

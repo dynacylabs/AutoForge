@@ -1,0 +1,832 @@
+import asyncio
+import os
+import copy
+import threading
+import time
+import uuid
+
+import torch
+from fastapi import APIRouter, HTTPException
+from ..models import PruningSettings
+from ..services.optimization_service import get_optimization_service
+from ..helpers.auto_prune import AutoPruneSearch
+from ..helpers.pipeline_runner import friendly_error_message
+from ..helpers.result_store import (
+    ResultUnavailable,
+    rebuild_pipeline_result,
+    register_pipeline_result,
+    resolve_pipeline_result,
+    save_solution,
+    solution_from_sliders,
+)
+from ..helpers.sliders import guidance_report_from_optimizer, result_counts_from_optimizer, should_repeat_prune
+from ..helpers.telemetry import capture_exception
+from ..config import config
+from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
+
+router = APIRouter()
+
+# Mirrors api/preview.py's INIT_JOB_SENTINEL: the pre-run auto-preview.
+INIT_JOB_SENTINEL = "__init__"
+
+
+def _init_solution(settings: PruningSettings) -> dict:
+    """The auto-preview's heightmap with the request's color layers, and
+    the image to rebuild it against. Raises HTTPException when it can't be
+    pruned."""
+    import numpy as np
+
+    from ..services.image_service import get_image_service
+    from .init import get_init_pipeline_result
+
+    run_settings = settings.settings
+    if run_settings is None or not run_settings.input_image:
+        raise HTTPException(400, "Upload an input image first.")
+    init_result = get_init_pipeline_result()
+    heights = None
+    if init_result:
+        full_logits = init_result.get("pixel_height_logits_init")
+        if isinstance(full_logits, np.ndarray):
+            # A preview built from the photo trains at the processing
+            # resolution; its heights exist at the output resolution too.
+            from autoforge.Modules.Optimizer import _discretize_height_only
+
+            optimizer = init_result["optimizer"]
+            heights = _discretize_height_only(
+                torch.from_numpy(full_logits.astype(np.float32)), float(optimizer.h), int(optimizer.max_layers),
+            )
+        else:
+            _global, heights = init_result["optimizer"].get_discretized_solution(best=True)
+    if heights is None:
+        raise HTTPException(400, "The preview of the image isn't ready yet. Wait for it, then try again.")
+    image_path = get_image_service().get_path(run_settings.input_image)
+    if image_path is None:
+        raise HTTPException(404, f"Input image not found: {run_settings.input_image}")
+    settings_dict = run_settings.model_dump()
+    for key in ("priority_mask", "height_regions"):
+        mask = settings_dict.get(key) or ""
+        settings_dict[key] = (get_image_service().get_path(mask) or "") if mask else ""
+    try:
+        solution = solution_from_sliders(
+            heights.detach().cpu().numpy().astype(np.int64),
+            settings.sliders,
+            settings.active_filaments,
+            settings_dict,
+            background_color=settings.background_color,
+            base=settings.base,
+        )
+    except ResultUnavailable as e:
+        raise HTTPException(400, str(e))
+    return {"solution": solution, "image_path": image_path}
+
+
+@router.post("/start")
+async def start_pruning(settings: PruningSettings):
+    svc = get_optimization_service()
+
+    # The previous job's thread may still be stopping (see workers).
+    if running_worker() is not None and await asyncio.to_thread(wait_until_idle, 2.0) is not None:
+        raise HTTPException(409, STILL_STOPPING)
+
+    # Pruning drives the same GPU (and the same FilamentOptimizer as any
+    # active optimization) — two such jobs running concurrently interleave
+    # mutations of `optimizer.best_params` and write the same output files,
+    # so this is a hard mutex, not a recommendation. A double-click on
+    # "Start pruning" used to start a second prune thread on the same
+    # result.
+    from ..helpers.guidance_views import QUICK_PREVIEW_BUSY, quick_preview_running
+
+    if quick_preview_running():
+        raise HTTPException(409, QUICK_PREVIEW_BUSY)
+    busy = svc.get_any_active_job()
+    if busy is not None:
+        if busy.job_id.startswith("prune-"):
+            raise HTTPException(
+                409,
+                f"Pruning is already {busy.status}. Let it finish or cancel it before starting another pass.",
+            )
+        raise HTTPException(
+            409,
+            f"An optimization is {busy.status}. Let it finish or cancel it before pruning.",
+        )
+
+    from .init import is_init_building
+
+    if is_init_building():
+        raise HTTPException(
+            409,
+            "The preview of the image is still being prepared. Wait for it to finish, then try again.",
+        )
+
+    # Pruning must operate on the specific result the frontend is looking
+    # at (its `currentJob`) — not "whatever completed job happens to be
+    # most recent in history". This backend keeps job records across
+    # restarts, so without pinning to an explicit job_id, a user could open
+    # the app fresh (no optimization run yet this session) and still
+    # successfully "prune" some unrelated leftover job from a previous
+    # session/image. Requiring — and validating — job_id closes that gap
+    # and also naturally blocks pruning before any optimization has run.
+    if not settings.job_id:
+        raise HTTPException(400, "Run an optimization first — there's no result to prune yet.")
+    # The auto-preview — a loaded project, or an image colored by hand —
+    # prunes from its heightmap and the color layers sent along.
+    from_init = settings.job_id == INIT_JOB_SENTINEL
+    init_solution = None
+    if from_init:
+        init_solution = await asyncio.to_thread(_init_solution, settings)
+        job_inputs = {"input_image": settings.settings.input_image, "flatforge": settings.settings.flatforge}
+    else:
+        target_job = svc.get_job(settings.job_id)
+        if not target_job or target_job.status != "completed":
+            raise HTTPException(400, "Run an optimization first — there's no completed result to prune yet.")
+        job_inputs = {"input_image": target_job.input_image, "flatforge": target_job.flatforge}
+    job_id = settings.job_id
+
+    # Create a pruning job via the public API
+    import datetime
+    from datetime import timezone
+
+    prune_job_id = f"prune-{uuid.uuid4().hex[:8]}"
+    # input_image/flatforge carry over so this job is restorable exactly
+    # like an optimization job once it completes (see get_latest_job and
+    # jobBelongsToImage) — a successful prune clones a real, independent
+    # result under this id (below), it is no longer just a progress tracker.
+    # input_image/flatforge are Optional[str]/Optional[bool] on JobStatus but
+    # plain (non-optional) fields on the settings model create_job() also
+    # populates — omit whichever is None rather than pass it through, which
+    # that model rejects.
+    prune_job_settings: dict = {"iterations": 1}
+    if job_inputs["input_image"]:
+        prune_job_settings["input_image"] = job_inputs["input_image"]
+    if job_inputs["flatforge"] is not None:
+        prune_job_settings["flatforge"] = job_inputs["flatforge"]
+    svc.create_job(prune_job_settings, job_id=prune_job_id)
+    cancel_event = svc.cancel_event(prune_job_id)
+    pause_event = svc.pause_event(prune_job_id)
+
+    # What a cancelled or failed prune needs to put back (see _roll_back).
+    rollback: dict = {}
+
+    def _roll_back() -> None:
+        """Return the result to exactly what `job_id` held before this prune.
+
+        Only a *completed* prune becomes the frontend's current job; after a
+        cancel or a failure it stays on `job_id`. The optimizer had already
+        been claimed and (partly) pruned, so that job then answered "pruned
+        since" to every recolor and prune, and nothing could reach the result
+        at all until the next run. Restore the solution, hand ownership back,
+        and re-send the stack — the per-pass broadcasts had already replaced
+        the frontend's sliders with pruned ones."""
+        optimizer = rollback.get("optimizer")
+        if optimizer is None:
+            return
+        try:
+            if rollback["snapshot"] is not None:
+                optimizer.restore_solution_snapshot(rollback["snapshot"])
+            optimizer._prune_runs = rollback["prune_runs"]
+            optimizer.preview_callback = rollback["preview_callback"]
+            optimizer.prune_step_callback = None
+        finally:
+            if from_init:
+                # Built for this prune only: nothing to hand back.
+                svc.clear_pipeline_result(prune_job_id)
+            else:
+                svc.return_pipeline_result(job_id, prune_job_id)
+        broadcast = rollback.get("broadcast")
+        if broadcast is not None:
+            broadcast()
+
+    auto = settings.mode == "auto"
+
+    def _run():
+        try:
+            svc.update_status(prune_job_id, "running")
+
+            if from_init:
+                svc.update_status(prune_job_id, "running", phase="Preparing")
+                pipeline_result = rebuild_pipeline_result(
+                    init_solution["solution"], init_solution["image_path"],
+                    os.path.join(config.checkpoints_path, prune_job_id),
+                )
+                register_pipeline_result(prune_job_id, pipeline_result)
+            else:
+                # The server only keeps the newest result, and none across a
+                # restart: bring this one back from its saved solution.
+                try:
+                    resolve_pipeline_result(job_id, allow_while_job=prune_job_id)
+                except ResultUnavailable as e:
+                    svc.update_status(prune_job_id, "failed", error=str(e))
+                    return
+                # Take over the optimization job's pipeline result: pruning
+                # mutates its optimizer in place, so from here on it no longer
+                # holds `job_id`'s solution (see get_pipeline_result).
+                pipeline_result = svc.claim_pipeline_result(prune_job_id, job_id)
+            if not pipeline_result:
+                svc.update_status(prune_job_id, "failed",
+                                  error="This result isn't available anymore. Go to the newest result, "
+                                        "or run optimization first.")
+                return
+            claimed_optimizer = pipeline_result["optimizer"]
+            # The current CUDA device is per thread (see activate_device).
+            from autoforge.Helper.DeviceUtils import activate_device
+
+            activate_device(pipeline_result.get("device"))
+            snapshot = None
+            if hasattr(claimed_optimizer, "solution_snapshot"):
+                snapshot = claimed_optimizer.solution_snapshot()
+                logits = snapshot.get("pixel_height_logits")
+                if isinstance(logits, torch.Tensor):
+                    snapshot["pixel_height_logits"] = logits.detach().clone()
+            rollback.update(
+                optimizer=claimed_optimizer,
+                snapshot=snapshot,
+                prune_runs=getattr(claimed_optimizer, "_prune_runs", 0),
+                preview_callback=getattr(claimed_optimizer, "preview_callback", None),
+            )
+
+            from ..helpers.pipeline_runner import export_results
+
+            # Copy args to avoid mutating the stored pipeline result
+            args = copy.copy(pipeline_result["args"])
+            args.pruning_max_colors = settings.pruning_max_colors
+            args.pruning_max_swaps = settings.pruning_max_swaps
+            args.pruning_max_layer = settings.pruning_max_layer
+            args.perform_pruning = True
+            args.prune_seed_search = settings.seed_search
+            args.prune_seed_search_count = settings.seed_search_count
+            args.prune_fine_tune_height = settings.fine_tune_height
+            args.prune_fine_tune_steps = settings.fine_tune_steps
+
+            # Every prune invocation writes into its *own*, fresh directory
+            # rather than overwriting the job it started from. Pruning used
+            # to always write into checkpoints/<job_id> — the same
+            # directory the original optimization (and any earlier prune
+            # pass on it) had already written to — so a second pruning pass
+            # silently replaced the first pass's output files in place.
+            # Anything that still referenced the *original* job id (a
+            # history step captured right after the first pass, an F5
+            # reload) then showed whatever pruning had most recently done
+            # to that shared directory instead of what was actually true
+            # when it was captured. Each pass gets its own id and directory
+            # instead, and the frontend switches to treating this new id as
+            # the current job once it completes (see appStore.startPruning)
+            # — so a subsequent pass targets *this* directory, never an
+            # earlier one.
+            output_dir = os.path.join(config.checkpoints_path, prune_job_id)
+            args.output_folder = output_dir
+            os.makedirs(output_dir, exist_ok=True)
+
+            pipeline_result = dict(pipeline_result)
+            pipeline_result["args"] = args
+
+            # Report pruning progress through the optimizer's preview callback
+            # so the frontend can show it in the top progress bar. Pruning
+            # runs through several genuinely distinct phases in a fixed
+            # order (see FilamentOptimizer.prune's `_current_prune_phase`),
+            # each raising its own preview_callback(..., phase=<name>) calls
+            # with a stage-relative, non-monotonic percent (negative,
+            # climbing to 0 for the reduction phases; ~90-99 for swap
+            # position optimisation). Give each phase an equal-width slice
+            # of the 0-100 bar instead of the old percent-magnitude
+            # heuristics, which happened to lump colour/swap/layer
+            # reduction into one shared 50%-wide bucket (they all report
+            # percent <= 0) while swap-position optimisation alone got the
+            # other half.
+            optimizer = pipeline_result["optimizer"]
+            # In the order prune() runs them. The two optional polish phases
+            # only take a slice of the bar when they're actually enabled, so
+            # the progress doesn't stall at 0% for a phase that never runs.
+            # They report a plain 0-100 fraction of their own work
+            # (_prune_phase_progress), unlike the older phases below.
+            DIRECT_PERCENT_PHASES = {
+                "Searching color seeds",
+                "Polishing heights",
+                "Fine-tuning height",
+                "Searching layer stacks",
+                "Refining pixel heights",
+                "Removing spikes",
+                "Saving the result",
+            }
+            pixel_refine = getattr(args, "pixel_height_refine", True)
+            phases = [
+                *(["Searching color seeds"] if settings.seed_search else []),
+                *(["Polishing heights"] if settings.fine_tune_height else []),
+                "Reducing colors",
+                "Reducing swaps",
+                "Reducing layers",
+                "Optimising swap positions",
+                # prune()'s closing steps, in its order: the height fine-tune
+                # for the reduced stack (with the polish setting), the stack
+                # search and per-pixel height refinement, then spike cleanup
+                # gated on `args.spike_removal` exactly as Optimizer.prune()
+                # gates it. An unknown phase name goes into the *last* bucket
+                # (see below), never back to 0%.
+                *(["Fine-tuning height"] if settings.fine_tune_height else []),
+                *(["Searching layer stacks"] if pixel_refine and getattr(args, "stack_search", True) else []),
+                *(["Refining pixel heights"] if pixel_refine else []),
+                *(["Removing spikes"] if getattr(args, "spike_removal", True) else []),
+                # Writing the pruned result's files (export_results). Automatic
+                # pruning only writes them once, after its last pass.
+                *([] if auto else ["Saving the result"]),
+            ]
+            # Slices weighted by how long each step usually takes, so the bar
+            # moves at a roughly even pace.
+            WEIGHTS = {"Searching layer stacks": 2.0, "Refining pixel heights": 2.0, "Removing spikes": 2.0}
+            weights = [WEIGHTS.get(p, 1.0) for p in phases]
+            total_weight = sum(weights)
+            slice_start = [100.0 * sum(weights[:i]) / total_weight for i in range(len(phases))]
+            slice_width = [100.0 * w / total_weight for w in weights]
+            _last = 0.0
+            _phase_min_seen: dict[str, float] = {}
+            # Re-deriving the discrete solution means a full discretize pass
+            # plus a device->host copy; pruning fires its callback far more
+            # often than a person can read a number, so sample it at most
+            # once a second and reuse the last counts in between.
+            _COUNTS_INTERVAL_S = 1.0
+            _counts_state = {"at": 0.0, "value": None}
+
+            def _live_counts() -> dict:
+                now = time.monotonic()
+                if _counts_state["value"] is None or now - _counts_state["at"] >= _COUNTS_INTERVAL_S:
+                    try:
+                        counts = result_counts_from_optimizer(optimizer)
+                    except Exception:
+                        counts = None
+                    _counts_state["at"] = now
+                    if counts is not None:
+                        _counts_state["value"] = counts
+                value = _counts_state["value"]
+                if not value:
+                    return {}
+                return {
+                    "result_colors": value["colors"],
+                    "result_swaps": value["swaps"],
+                    "result_layers": value["layers"],
+                }
+
+            # Pass bookkeeping for auto-repeat. Each pass is a full prune, so
+            # the 0-100 bar is per-pass; the pass number rides along in the
+            # status so the UI can say which one is running.
+            _pass = 1
+
+            def _pass_fields() -> dict:
+                if auto:
+                    return {"pruning_pass": _pass}
+                if not settings.auto_repeat:
+                    return {}
+                return {"pruning_pass": _pass, "pruning_max_passes": settings.max_passes}
+
+            def _prune_progress(_optimizer, _percent, phase=None, loss=None):
+                nonlocal _last
+                phase_name = phase or phases[0]
+                # A phase name not in the list (the optimizer reports one
+                # this webui version doesn't know about yet — e.g. a future
+                # phase added to Optimizer.prune's ordering) is far more
+                # likely to be a *late* one than the very first: pruning's
+                # named phases run in a fixed, append-only order, so bucket
+                # it at the end rather than jumping the bar back to 0%.
+                phase_idx = phases.index(phase_name) if phase_name in phases else len(phases) - 1
+                bucket_start = slice_start[phase_idx]
+                phase_slice = slice_width[phase_idx]
+
+                if phase_name in DIRECT_PERCENT_PHASES:
+                    # Reported as a plain 0-100 fraction of this phase's work.
+                    within = min(1.0, max(0.0, float(_percent) / 100.0))
+                elif phase_name == "Optimising swap positions":
+                    # Raw percent here is "90 + pass number" (capped at 99) —
+                    # a small incrementing pass counter, not a 0-100 fraction
+                    # of this phase's own work. Rescale it onto this phase's
+                    # slice instead of taking it as an absolute percentage.
+                    within = min(1.0, max(0.0, (float(_percent) - 90.0) / 9.0))
+                else:
+                    # Colour/swap/layer reduction: percent starts very
+                    # negative and climbs toward 0 as the search converges.
+                    # Track each phase's own low-water mark separately so
+                    # they don't share (and corrupt) one running minimum.
+                    seen = min(_phase_min_seen.get(phase_name, float(_percent)), float(_percent))
+                    _phase_min_seen[phase_name] = seen
+                    denom = 0.0 - seen
+                    within = (float(_percent) - seen) / denom if denom > 1e-9 else 0.0
+                    within = min(1.0, max(0.0, within))
+
+                p = bucket_start + within * phase_slice
+                _last = max(_last, min(p, 100.0))
+                # The polish phases carry their own best-so-far loss; the
+                # reduction phases leave it alone (their progress shows in
+                # the counts instead).
+                loss_field = {} if loss is None else {"loss": float(loss)}
+                svc.update_status(
+                    prune_job_id, "running", progress=_last, phase=phase_name,
+                    **loss_field, **_live_counts(), **_pass_fields(),
+                )
+
+            optimizer.preview_callback = _prune_progress
+
+            # No discard_slider_edits(job_id) here any more: pruning writes
+            # into its own directory, so `job_id`'s files — including the
+            # user's slider-edited mesh — are that result as it was, and are
+            # what an undo back to it has to show.
+
+            def _broadcast_result(final_image=None, live_mesh: dict | None = None) -> None:
+                """Push the pruned slider stack + image to the frontend, so
+                the color layers and both previews follow each pass.
+                `live_mesh` points the 3D view at the mesh of the solution as
+                it stands mid-prune (see _on_prune_step)."""
+                try:
+                    from ..helpers.sliders import derive_sliders_from_result
+                    from .ws import broadcast_preview
+
+                    slider_data = derive_sliders_from_result(pipeline_result)
+                    if not (slider_data and slider_data["sliders"]):
+                        return
+                    if final_image is None:
+                        final_image = optimizer.get_best_discretized_image()
+                    if final_image is None:
+                        return
+                    from .ws import encode_png_b64
+
+                    broadcast_preview(
+                        encode_png_b64(final_image),
+                        # A client matches broadcasts against
+                        # currentJob.job_id, which is still `job_id` (the id
+                        # this prune action started from) for the whole
+                        # duration of this call — the frontend only switches
+                        # currentJob to the freshly-cloned `prune_job_id`
+                        # once this action fully completes (see
+                        # appStore.startPruning), so mid-run broadcasts must
+                        # keep targeting the id it's showing right now.
+                        job_id=job_id,
+                        sliders=slider_data["sliders"],
+                        min_layer=slider_data["min_layer"],
+                        max_layer=slider_data["max_layer"],
+                        live_mesh=live_mesh,
+                    )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+            rollback["broadcast"] = _broadcast_result
+
+            # The solution the last live mesh was built from, so a step that
+            # changed nothing (a phase with no improvement, or one already
+            # within its limit) doesn't rebuild and resend the same mesh.
+            _last_step_solution: dict = {}
+
+            def _on_prune_step(_optimizer, _step: str) -> None:
+                """After each pruning step: build the mesh of the solution as
+                it now stands and point the 3D view at it. Without this the
+                3D view only changed once the whole prune had finished.
+
+                The mesh goes to the prune job's own LIVE_PLY, never to
+                `job_id`'s files — those stay the result as it was, for an
+                undo or a cancel. Only the GPU reads happen here, on the
+                prune thread; the (slow) mesh build and export run in the
+                background, coalesced when steps finish back to back."""
+                import cv2
+                import numpy as np
+
+                from ..helpers.colored_mesh import generate_colored_preview_mesh
+                from ..helpers.mesh_persist import schedule_persist
+                from .outputs import LIVE_PLY, live_mesh_target
+
+                disc_global, disc_height = optimizer.get_discretized_solution(best=True)
+                if disc_global is None or disc_height is None:
+                    return
+                previous = _last_step_solution.get("value")
+                if previous is not None and torch.equal(previous[0], disc_global) and torch.equal(previous[1], disc_height):
+                    return
+                _last_step_solution["value"] = (disc_global.clone(), disc_height.clone())
+
+                final_image = optimizer.get_best_discretized_image()
+                if final_image is None:
+                    return
+                height_map_mm = disc_height.cpu().numpy().astype(np.float32) * float(args.layer_height)
+                from autoforge.Helper.ImageHelper import image_to_uint8
+
+                color = np.ascontiguousarray(image_to_uint8(final_image)[..., :3])
+                if color.shape[:2] != height_map_mm.shape[:2]:
+                    color = cv2.resize(
+                        color, (height_map_mm.shape[1], height_map_mm.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                alpha = pipeline_result.get("alpha")
+                background_height = float(args.background_height)
+                stl_output_size = float(args.stl_output_size)
+
+                def _write() -> None:
+                    mesh = generate_colored_preview_mesh(
+                        height_map=height_map_mm,
+                        color_image=color,
+                        background_height=background_height,
+                        maximum_x_y_size=stl_output_size,
+                        alpha_mask=alpha,
+                    )
+                    ply_path = os.path.join(output_dir, LIVE_PLY)
+                    tmp = f"{ply_path}.{threading.get_ident()}.tmp.ply"
+                    mesh.export(tmp, encoding="binary")
+                    os.replace(tmp, ply_path)
+
+                schedule_persist(live_mesh_target(prune_job_id), _write)
+                _broadcast_result(
+                    final_image,
+                    live_mesh={"prune_job_id": prune_job_id, "url": f"/api/outputs/live-ply/{prune_job_id}"},
+                )
+
+            optimizer.prune_step_callback = _on_prune_step
+
+            def _discrete_loss() -> float | None:
+                """The loss of the solution as it now stands — the measure
+                auto-repeat decides on. Deliberately the same
+                `_compute_loss_for_heightmap` the pruning phases score
+                against, so "no improvement" means the same thing here as it
+                does inside them."""
+                try:
+                    from autoforge.Helper.PruningHelper import _compute_loss_for_heightmap
+
+                    disc_global, _ = optimizer.get_discretized_solution(best=True)
+                    if disc_global is None:
+                        return None
+                    return float(_compute_loss_for_heightmap(optimizer, disc_global))
+                except Exception:
+                    return None
+
+            best_loss: float | None = None
+            cancelled_midway = False
+            max_passes = settings.max_passes if settings.auto_repeat else 1
+
+            # Where we started, so the dialog can show what pruning gained
+            # rather than a bare number with nothing to compare it to.
+            start_loss = _discrete_loss()
+            svc.update_status(
+                prune_job_id, "running", pruning_start_loss=start_loss, loss=start_loss,
+            )
+
+            def _clone_solution(snapshot: dict) -> dict:
+                """A snapshot that later pruning can't change: the live
+                optimizer takes over whatever dict it is restored from, and
+                pruning mutates those tensors in place."""
+                out = dict(snapshot)
+                out["best_params"] = {
+                    k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in snapshot["best_params"].items()
+                }
+                logits = snapshot.get("pixel_height_logits")
+                if isinstance(logits, torch.Tensor):
+                    out["pixel_height_logits"] = logits.detach().clone()
+                return out
+
+            def _cancelled_while_waiting() -> bool:
+                """Blocks while paused; True if the job was cancelled."""
+                while pause_event is not None and pause_event.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return True
+                    time.sleep(0.1)
+                return cancel_event is not None and cancel_event.is_set()
+
+            auto_result: dict = {}
+
+            def _run_auto_passes() -> tuple[str | None, bool]:
+                """Automatic pruning: lower the limits pass by pass while the
+                loss stays within the target, and finish on the last pass that
+                did. A pass that goes over is undone, so what is left in the
+                optimizer is always the last good solution. Returns
+                (why it stopped, whether it was cancelled)."""
+                nonlocal _pass, _last
+                target = float(settings.target_loss)
+                passes_log: list[dict] = []
+
+                def publish(**fields) -> None:
+                    svc.update_status(
+                        prune_job_id, "running", auto_target_loss=target,
+                        auto_passes=list(passes_log), **fields,
+                    )
+
+                start = start_loss
+                if not getattr(optimizer, "_full_res_height_restored", False):
+                    # A result's first export switches it to the output
+                    # resolution, and the loss is only comparable with the
+                    # target from there on (the start loss above was measured
+                    # before that). Nothing is pruned or written yet.
+                    args.perform_pruning = False
+                    export_results(
+                        pipeline_result, cancel_event=cancel_event, pause_event=pause_event, prune_only=True,
+                    )
+                    args.perform_pruning = True
+                    start = _discrete_loss()
+                    svc.update_status(prune_job_id, "running", pruning_start_loss=start, loss=start)
+                good_counts = result_counts_from_optimizer(optimizer)
+                if start is None or good_counts is None:
+                    raise RuntimeError("Couldn't measure this result, so there is nothing to compare the target against.")
+                good_loss = start
+                good = _clone_solution(optimizer.solution_snapshot())
+                publish()
+
+                outcome: str | None = "start_above_limit"
+                if start <= target:
+                    search = AutoPruneSearch(
+                        good_counts, min_layers=int(getattr(args, "min_layers", 1)), target=target,
+                    )
+                    while True:
+                        if _cancelled_while_waiting():
+                            return None, True
+                        limits = search.propose(good_counts)
+                        if limits is None:
+                            outcome = search.outcome
+                            break
+                        _pass = search.passes
+                        # Each pass starts its own 0-100 sweep.
+                        _last = 0.0
+                        _phase_min_seen.clear()
+                        _counts_state["value"] = None
+                        args.pruning_max_colors = limits["colors"]
+                        args.pruning_max_swaps = limits["swaps"]
+                        args.pruning_max_layer = limits["layers"]
+                        publish(progress=0.0, phase=phases[0], **_live_counts(), **_pass_fields())
+
+                        # Spike removal on every pass: it changes the loss, and
+                        # the decision has to be made on what would be printed.
+                        outputs = export_results(
+                            pipeline_result,
+                            cancel_event=cancel_event,
+                            pause_event=pause_event,
+                            apply_spike_removal=True,
+                            prune_only=True,
+                        )
+                        if not outputs.get("pruning_completed", True) or (
+                            cancel_event is not None and cancel_event.is_set()
+                        ):
+                            return None, True
+
+                        loss = _discrete_loss()
+                        counts = result_counts_from_optimizer(optimizer)
+                        kept = loss is not None and counts is not None and loss <= target
+                        passes_log.append({
+                            "pass": _pass,
+                            "colors": counts["colors"] if counts else None,
+                            "swaps": counts["swaps"] if counts else None,
+                            "layers": counts["layers"] if counts else None,
+                            "loss": loss,
+                            "kept": kept,
+                        })
+                        if kept:
+                            good = _clone_solution(optimizer.solution_snapshot())
+                            good_counts, good_loss = counts, loss
+                            search.accept(loss)
+                        else:
+                            optimizer.restore_solution_snapshot(_clone_solution(good))
+                            search.reject(loss)
+                        _counts_state["value"] = None
+                        # The preview between passes: the kept result, or the
+                        # one it went back to.
+                        _broadcast_result()
+                        publish(
+                            progress=100.0,
+                            phase="Pruned" if kept else "Over the limit, going back",
+                            loss=good_loss, **_live_counts(), **_pass_fields(),
+                        )
+                        if search.outcome is not None:
+                            outcome = search.outcome
+                            break
+
+                # Only now are the result's files written, for the solution
+                # the optimizer holds - the last good one.
+                args.perform_pruning = False
+                args.pruning_max_colors = good_counts["colors"]
+                args.pruning_max_swaps = good_counts["swaps"]
+                args.pruning_max_layer = good_counts["layers"]
+                publish(progress=0.0, phase="Saving the result", loss=good_loss, **_pass_fields())
+                export_results(
+                    pipeline_result,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    export_progress=lambda f: svc.update_status(
+                        prune_job_id, "running", progress=100.0 * f, phase="Saving the result",
+                    ),
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return None, True
+                auto_result.update(auto_outcome=outcome, loss=good_loss, auto_passes=passes_log)
+                return outcome, False
+
+            # Spike removal is a printability trade-off (see
+            # Optimizer.post_remove_spikes), not part of the color/swap/layer
+            # search — running it every auto-repeat pass paid its accuracy
+            # cost, and the extra compute, on intermediate results that the
+            # next pass was about to prune further anyway. It only has to run
+            # once the loop has actually settled, so every pass here applies
+            # it only when this is known to be the *last* one: either
+            # auto-repeat is off (a single pass is always "the end"), or the
+            # convergence check just below decided to stop and scheduled one
+            # extra pass purely to finish with spikes cleaned up.
+            final_spike_pass = False
+            if auto:
+                _outcome, cancelled_midway = _run_auto_passes()
+            else:
+                while True:
+                    # Each pass starts its own 0-100 sweep.
+                    _last = 0.0
+                    _phase_min_seen.clear()
+                    _counts_state["value"] = None
+                    # Publish the starting counts immediately: the dialog opens on
+                    # "Reducing colors" with the bar at 0, and showing "—" there
+                    # until the first callback landed looked like a stall.
+                    svc.update_status(
+                        prune_job_id, "running", progress=0.0, phase=phases[0],
+                        **_live_counts(), **_pass_fields(),
+                    )
+
+                    apply_spikes = (not settings.auto_repeat) or final_spike_pass
+                    outputs = export_results(
+                        pipeline_result,
+                        cancel_event=cancel_event,
+                        pause_event=pause_event,
+                        apply_spike_removal=apply_spikes,
+                        export_progress=lambda f: _prune_progress(optimizer, 100.0 * f, phase="Saving the result"),
+                    )
+                    # Cancelled between phases. The frontend stays on the result
+                    # pruning started from, so the solution is rolled back to it
+                    # below (_roll_back) rather than left half-pruned.
+                    # A cancel that arrived after the last phase, while the result
+                    # was being saved, counts too: the job is "cancelled" already.
+                    if not outputs.get("pruning_completed", True) or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        cancelled_midway = True
+                        break
+
+                    _broadcast_result()
+                    loss = _discrete_loss()
+                    _counts_state["value"] = None
+                    svc.update_status(
+                        prune_job_id, "running", progress=100.0, phase="Pruned",
+                        loss=loss, **_live_counts(), **_pass_fields(),
+                    )
+
+                    if not settings.auto_repeat or final_spike_pass:
+                        break
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled_midway = True
+                        break
+                    repeat, reason = should_repeat_prune(_pass, max_passes, loss, best_loss)
+                    if loss is not None and (best_loss is None or loss < best_loss):
+                        best_loss = loss
+                    if not repeat:
+                        print(f"Auto-repeat pruning: stopping after pass {_pass} — {reason}.")
+                        if getattr(args, "spike_removal", True):
+                            # One more pass, purely to clean up spikes on the
+                            # converged result — everything else is already
+                            # within its limits so the reduction phases exit
+                            # immediately, leaving only the spike pass to do
+                            # real work.
+                            final_spike_pass = True
+                            _pass += 1
+                            continue
+                        break
+                    _pass += 1
+
+            _counts_state["value"] = None  # force a fresh read of the final solution
+            if cancelled_midway:
+                _roll_back()
+                svc.update_status(
+                    prune_job_id, "cancelled", phase=None, **_live_counts(), **_pass_fields(),
+                )
+            else:
+                # This job now has its own real output directory (written
+                # above) and needs its own pipeline result to match — a
+                # follow-up prune, or a slider-derivation lookup, targeting
+                # this id must find the (still-mutating) optimizer, not
+                # come up empty. Aliasing, not re-registering: see
+                # alias_pipeline_result for why this must not go through
+                # set_pipeline_result's "release every older result" path.
+                optimizer.prune_step_callback = None
+                # On disk first, so this result outlives the server and can be
+                # brought back once a newer one replaces it in memory.
+                try:
+                    save_solution(output_dir, pipeline_result)
+                except Exception as e:
+                    capture_exception(e, {"phase": "save_solution", "job_id": prune_job_id})
+                try:
+                    guidance = guidance_report_from_optimizer(optimizer)
+                except Exception:
+                    guidance = None
+                if not svc.complete_prune(
+                    prune_job_id, job_id, progress=100.0, phase=None,
+                    **_live_counts(), **_pass_fields(),
+                    **({"guidance_report": guidance} if guidance is not None else {}),
+                    **({"auto_outcome": auto_result.get("auto_outcome"), "loss": auto_result.get("loss")} if auto else {}),
+                ):
+                    # Cancelled in the last moment: the frontend stays on
+                    # `job_id`, so it gets its result back as it was.
+                    _roll_back()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            capture_exception(e, {"phase": "pruning", "job_id": prune_job_id})
+            try:
+                _roll_back()
+            except Exception:
+                traceback.print_exc()
+            svc.update_status(prune_job_id, "failed", error=friendly_error_message(e))
+
+    start_worker(prune_job_id, _run)
+    return {"job_id": prune_job_id, "status": "running"}

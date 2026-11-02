@@ -17,10 +17,26 @@ behavior should have changed relative to the previous monolithic version.
 """
 
 import argparse
+import copy
+import json
 import sys
 import os
+import shutil
 import traceback
 from typing import Optional, Tuple, List
+
+# Must be set before the CUDA context is created (i.e. before any actual
+# CUDA op - `import torch` alone doesn't trigger this). PyTorch's default
+# caching allocator can end up reserving noticeably more driver memory than
+# what's actually live at the peak, because it services allocation requests
+# from same-sized "segments" and can't split/merge across their boundaries -
+# with the mixed transient tensor sizes this pipeline creates (see
+# composite_image_cont/_disc), that fragmentation is significant. Measured
+# on this repo's benchmark (stl_output_size=150, 500 iters): peak reserved
+# 2.10GB -> 1.46GB, peak nvidia-smi-reported process VRAM 2.28GB -> 1.67GB,
+# with identical loss - pure allocator behavior, zero precision/algorithm
+# impact. setdefault() so a user's own explicit setting always wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import configargparse
 import cv2
@@ -30,28 +46,38 @@ from tqdm import tqdm
 
 from autoforge.Helper import PruningHelper
 from autoforge.Helper.AmpUtils import safe_autocast
+from autoforge.Helper.DeviceUtils import empty_cache
 from autoforge.Helper.FilamentHelper import hex_to_rgb, load_materials
 from autoforge.Helper.Heightmaps.FastTSPHeightMap import (
     run_init_threads,
 )
 
-from autoforge.Helper.ImageHelper import resize_image, imread
+from autoforge.Helper.ImageHelper import image_to_uint8, resize_image, imread, imwrite, to_bgr_or_bgra_uint8
 from autoforge.Helper.OtherHelper import set_seed, perform_basic_check, get_device
 from autoforge.Helper.OutputHelper import (
     generate_stl,
     generate_swap_instructions,
     generate_project_file,
     generate_flatforge_stls,
+    model_size_mm,
 )
-from autoforge.Modules.Optimizer import FilamentOptimizer
+from autoforge.Modules.Optimizer import FilamentOptimizer, _discretize_height_only
 
-# check if we can use torch.set_float32_matmul_precision('high')
-if torch.__version__ >= "2.0.0":
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception as e:
-        print("Warning: Could not set float32 matmul precision to high. Error:", e)
-        pass
+# TorchScript's tensor-expression fuser compiles a fused kernel the first
+# time each scripted function sees a new input signature. The big [L,H,W]
+# composites are Triton kernels now (see FusedComposite), so what is left
+# for it is small per-layer chains, where the first-call compiles (seconds
+# each, dozens of signatures across training and pruning) cost far more than
+# the fused kernels ever save. AF_TEXPR_FUSER=1 turns it back on.
+if os.environ.get("AF_TEXPR_FUSER", "0") != "1":
+    torch._C._jit_set_texpr_fuser_enabled(False)
+
+# No version check: comparing version strings sorted "10.0" below "2.0", and
+# every supported torch has this call (the try covers one that doesn't).
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception as e:
+    print("Warning: Could not set float32 matmul precision to high. Error:", e)
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +87,23 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Populated arguments structure. Some parameters may be adjusted later
         (e.g., num_init_cluster_layers when -1 to infer from max_layers).
     """
+    return build_parser().parse_args()
+
+
+def cli_defaults() -> dict:
+    """Every CLI option's default, by its attribute name. The webui builds
+    its run settings on top of these, so a new CLI option (and its default)
+    reaches webui runs too instead of falling back to whatever getattr
+    default the code that reads it happens to use."""
+    return {
+        action.dest: action.default
+        for action in build_parser()._actions
+        if action.dest not in ("help", "config") and action.default is not argparse.SUPPRESS
+    }
+
+
+def build_parser() -> configargparse.ArgParser:
+    """The CLI's argument parser (see parse_args)."""
     parser = configargparse.ArgParser()
     parser.add_argument("--config", is_config_file=True, help="Path to config file")
 
@@ -185,9 +228,28 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--delta_grid",
+        type=int,
+        default=4,
+        help="Downscale factor of the trained smooth per-pixel height field (0 = off)",
+    )
+    parser.add_argument(
+        "--height_assign",
+        default=True,
+        help="At every discrete check, re-assign every pixel's height exactly for the current layer stack "
+        "(smoothed per-pixel assignment); the gradient steps train the materials in between",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--height_assign_smoothness",
+        type=float,
+        default=2.0,
+        help="--height_assign: cost per layer of height difference to each neighbour, traded against colour error",
+    )
+    parser.add_argument(
         "--early_stopping",
         type=int,
-        default=2000,
+        default=3000,
         help="Number of steps without improvement before stopping",
     )
 
@@ -227,8 +289,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--spike_removal_passes",
         type=int,
-        default=4,
-        help="Number of spike removal passes (4 approximates old BFS; higher = smoother but slower)",
+        default=-1,
+        help="Maximum number of spike removal passes (-1 = repeat until no spike is left)",
+    )
+
+    parser.add_argument(
+        "--pixel_height_refine",
+        default=True,
+        help="After pruning, refine every pixel's height individually by exact coordinate descent on the discrete loss (spike-aware after spike removal)",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--stack_search",
+        default=True,
+        help="With --pixel_height_refine: search the layer materials under a free-per-pixel-height palette proxy and keep the new stack if it lowers the real loss",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--stack_search_rounds",
+        type=int,
+        default=60,
+        help="Maximum number of perturb-and-descend rounds for --stack_search",
+    )
+    parser.add_argument(
+        "--edge_bleed",
+        type=float,
+        default=0.25,
+        help="Edge bleed strength (0-1): every layer's presence at a pixel blends with the mean of its 8 neighbours' by "
+        "this weight, so at a height step the taller side thins and shows its lower layers and the lower side takes on "
+        "some of the taller one's (0 = no bleed)",
+    )
+    parser.add_argument(
+        "--pixel_height_smoothness",
+        type=float,
+        default=1.0,
+        help="Pixel height refine: cost per layer of height difference to each neighbour, traded against colour error (keeps the height map printable; 0 = colour only)",
+    )
+    parser.add_argument(
+        "--pixel_height_anchor",
+        type=float,
+        default=0.0,
+        help="Pixel height refine: quadratic pull toward the height map pruning started from (0 = off)",
+    )
+    parser.add_argument(
+        "--pixel_height_refine_radius",
+        type=int,
+        default=3,
+        help="Candidate heights for --pixel_height_refine: -1 tries every height; r > 0 tries current +-r plus each pixel's free-height palette optimum (much faster)",
+    )
+    parser.add_argument(
+        "--stack_search_patience",
+        type=int,
+        default=15,
+        help="Stop the --stack_search after this many rounds without improvement",
+    )
+    parser.add_argument(
+        "--pixel_height_refine_sweeps",
+        type=int,
+        default=2,
+        help="Number of sweeps over the image for --pixel_height_refine",
     )
 
     parser.add_argument(
@@ -242,6 +361,162 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Max number of swaps allowed after pruning",
+    )
+
+    parser.add_argument(
+        "--optimize_background",
+        default=True,
+        help="With --auto_background_color: the optimizer chooses the base filament like any layer's, starting from the filament closest to the image's dominant color (the base keeps its --background_height)",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--spike_refine_blocks",
+        type=str,
+        default="1212121",
+        help="Block sizes of the spike-aware pixel height refine passes after spike removal (digits, e.g. 121)",
+    )
+    parser.add_argument(
+        "--stack_history_candidates",
+        type=int,
+        default=6,
+        help="Besides the best stack of the search, also height-refine this many of its last improvements and keep whichever gives the lowest real loss",
+    )
+    parser.add_argument(
+        "--layer_material_refine_window",
+        type=int,
+        default=2,
+        help="After the spike-aware refine, re-pick each layer's material among those within this many layers of it under the real loss (heights fixed), then refine the heights again; 0 disables",
+    )
+    parser.add_argument(
+        "--plateau_refine",
+        default=True,
+        help="After the spike-aware refine, move whole equal-height plateaus (region moves) under the real loss",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--plateau_refine_target",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Also region moves over connected areas of similar target colour",
+    )
+    parser.add_argument("--plateau_refine_passes", type=int, default=1)
+    parser.add_argument(
+        "--skip_legacy_prune",
+        default=False,
+        help="Skip the greedy colour/swap/layer pruning phases when the solution is already within the limits",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--palette_search",
+        default=False,
+        help="After the stack search, also try global palette moves (replace a material everywhere) and keep the stack if the real loss improves",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--constrained_opt",
+        default=False,
+        help="Hold --pruning_max_colors / --pruning_max_swaps during the optimization itself instead of pruning afterwards",
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--constraint_rho",
+        type=float,
+        default=0.0,
+        help="--constrained_opt: final weight of the pull toward the nearest stack within the limits",
+    )
+    parser.add_argument(
+        "--constraint_start",
+        type=float,
+        default=0.1,
+        help="--constrained_opt: fraction of the iterations after which the pull starts ramping up",
+    )
+    parser.add_argument(
+        "--constraint_full",
+        type=float,
+        default=0.6,
+        help="--constrained_opt: fraction of the iterations at which the pull reaches --constraint_rho",
+    )
+
+    parser.add_argument(
+        "--constraint_swap_margin",
+        type=float,
+        default=1.0,
+        help="--constrained_opt: the expected swaps are held at this fraction of the swap limit",
+    )
+    parser.add_argument(
+        "--constraint_dual_lr",
+        type=float,
+        default=0.01,
+        help="--constrained_opt: dual ascent step for the multipliers on the expected colour/swap counts",
+    )
+    parser.add_argument(
+        "--constraint_linear_moves",
+        default=False,
+        help="--constrained_opt: add linearized (Frank-Wolfe) moves to the local search",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--constraint_pin",
+        default=True,
+        help="--constrained_opt: in the final phase train the heights on the best feasible stack (pinned), alternating with the stack search",
+        action=argparse.BooleanOptionalAction,
+    )
+
+    parser.add_argument(
+        "--constraint_search_rounds",
+        type=int,
+        default=3,
+        help="--constrained_opt: rounds of feasible local search on the best stack at each discrete check once the pull is at full strength",
+    )
+
+    parser.add_argument(
+        "--intermediate_search_interval",
+        type=int,
+        default=1000,
+        help="Every N training steps run a short layer-stack search (within the colour/swap limits) and a per-pixel "
+        "height refine on the best solution, and continue training from the result (0 = off)",
+    )
+    parser.add_argument(
+        "--intermediate_search_start",
+        type=int,
+        default=2000,
+        help="--intermediate_search_interval: first step of the searches (the early steps explore; 0 = first at the interval)",
+    )
+    parser.add_argument(
+        "--intermediate_search_rounds",
+        type=int,
+        default=15,
+        help="--intermediate_search_interval: maximum perturb-and-descend rounds of each stack search",
+    )
+    parser.add_argument(
+        "--intermediate_search_patience",
+        type=int,
+        default=5,
+        help="--intermediate_search_interval: stop each stack search after this many rounds without improvement",
+    )
+    parser.add_argument(
+        "--intermediate_search_pin",
+        type=float,
+        default=0.0,
+        help="--intermediate_search_interval: logit margin (+-value) the found stack is written back into training "
+        "with; 0 leaves the stack logits to training and hands back only the heights",
+    )
+
+    parser.add_argument(
+        "--prune_sweep",
+        type=str,
+        default="",
+        help="Experiment mode (with --minimal_postprocess): prune the trained solution to each 'colors:swaps' limit in this comma separated list",
+    )
+
+    parser.add_argument(
+        "--minimal_postprocess",
+        default=False,
+        help="Experiment mode: after training skip every refinement step; with --perform_pruning only the colour and swap pruning run",
+        action=argparse.BooleanOptionalAction,
     )
 
     parser.add_argument(
@@ -259,6 +534,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--cuda_graph",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Capture the training forward/backward into a CUDA/HIP graph "
+        "(NVIDIA and AMD GPUs only; ignored on Apple Metal and CPU). "
+        "Large speedup for the launch-overhead-bound training loop; "
+        "--no-cuda_graph falls back to plain eager steps.",
+    )
+
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=0,
@@ -266,9 +551,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device to run on, e.g. 'cuda', 'cuda:1', 'mps', 'cpu'. "
+        "Defaults to auto-detection (CUDA/ROCm, then Apple Metal, then CPU). "
+        "Can also be set with the AUTOFORGE_DEVICE environment variable.",
+    )
+
+    parser.add_argument(
         "--mps",
         action="store_true",
-        help="Use the Metal Performance Shaders (MPS) backend, if available.",
+        help="Deprecated: Apple Metal (MPS) is now detected automatically. "
+        "Kept only to force MPS on a machine that also exposes a CUDA GPU; "
+        "prefer --device mps.",
     )
 
     parser.add_argument(
@@ -282,7 +578,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_init_rounds",
         type=int,
-        default=64,
+        default=1,
+        # Historically defaulted to 64, intended as a "best of N random
+        # restarts" search over the kmeans heightmap init. As currently
+        # implemented, additional rounds are pure overhead with zero effect
+        # on the result: the expensive over-clustering (Stage 1) is shared
+        # across all rounds already, the weighted-KMeans refinement (Stage
+        # 2, in _refine_clusters) is called with a hardcoded
+        # random_state=0 regardless of round, and the cluster ordering
+        # (tsp_order_mst_path) is a fully deterministic algorithm - so
+        # every round produces byte-identical clustering/ordering. The only
+        # thing that varies per round is the pixel *sample* used for the
+        # silhouette quality estimate, and the final round selection
+        # (`min(results, key=lambda x: x[2])`) doesn't even use that
+        # silhouette score, only the (round-invariant) ordering metric.
+        # Verified empirically (2 different --random_seed values,
+        # stl_output_size=150): rounds=1 produces bit-identical loss to the
+        # old rounds=64 default while being significantly faster. If the
+        # random_state=0 in _refine_clusters is ever intentionally
+        # unfixed to restore real per-round diversity, this default should
+        # be revisited.
         help="Number of rounds to choose the starting height map from.",
     )
 
@@ -350,9 +665,31 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to a priority mask image (same dimensions as input image). Non-empty: apply weighted loss (0.1 outside, 1.0 at max inside).",
     )
+    parser.add_argument(
+        "--priority_mask_strength",
+        type=float,
+        default=10.0,
+        help="How many times more a fully white pixel of --priority_mask counts than a black one (>= 1; default 10).",
+    )
+    parser.add_argument(
+        "--height_guidance",
+        type=str,
+        default="",
+        help="Height guidance: a JSON object (or a path to a .json file) suggesting where colours sit in the print - "
+        '{"strength": 1, "order": "auto|dark_to_light|light_to_dark", "pins": [{"filament": "<name or index>", '
+        '"position": 0.8}], "depth": false, "depth_flip": false, "colors": [{"color": "#rrggbb", "tolerance": 15, '
+        '"direction": "raise|lower"}]}. Positions are fractions of the print height (0 = base, 1 = top). '
+        "Soft: the optimizer trades it against the colour error.",
+    )
+    parser.add_argument(
+        "--height_regions",
+        type=str,
+        default="",
+        help="Optional RGBA image of painted height regions for --height_guidance: red strokes are raised toward "
+        "the top of the print, blue strokes lowered toward the base (alpha = how fully painted).",
+    )
 
-    args = parser.parse_args()
-    return args
+    return parser
 
 
 def _compute_dominant_image_color(
@@ -462,7 +799,7 @@ def _auto_select_background_color(
             args.background_material_name = None
         try:
             with open(
-                os.path.join(args.output_folder, "auto_background_color.txt"), "w"
+                os.path.join(args.output_folder, "auto_background_color.txt"), "w", encoding="utf-8"
             ) as f:
                 f.write(f"dominant_image_color={dominant_hex}\n")
                 f.write(f"chosen_filament_color={chosen_hex}\n")
@@ -513,8 +850,19 @@ def _compute_pixel_sizes(args) -> Tuple[int, int]:
         (computed_output_size, computed_processing_size)
     """
     computed_output_size = int(round(args.stl_output_size * 2 / args.nozzle_diameter))
-    computed_processing_size = int(
-        round(computed_output_size / args.processing_reduction_factor)
+    reduced_size = int(round(computed_output_size / args.processing_reduction_factor))
+    # Below MIN_PROCESSING_SIZE, applying the reduction factor barely moves
+    # the needle on training cost (the image is already tiny) but throws away
+    # a large fraction of the already-small pixel budget, which measurably
+    # hurts final loss - verified empirically (stl_output_size=20,
+    # nozzle=0.4, reduction_factor=2: processing_size 50->100 improved mean
+    # loss ~30% across 4 seeds for ~0% time/VRAM cost). Clamping only kicks
+    # in for small outputs; anything already at/above this resolution
+    # (e.g. the default stl_output_size=150 case, processing_size=375) is
+    # completely unaffected.
+    MIN_PROCESSING_SIZE = 100
+    computed_processing_size = min(
+        computed_output_size, max(MIN_PROCESSING_SIZE, reduced_size)
     )
     print(f"Computed solving pixel size: {computed_output_size}")
     return computed_output_size, computed_processing_size
@@ -537,20 +885,116 @@ def _load_priority_mask(
     """
     focus_map_full = None
     if args.priority_mask != "":
-        pm = imread(args.priority_mask, cv2.IMREAD_UNCHANGED)
-        if pm.ndim == 3:
-            if pm.shape[2] == 4:
-                pm = pm[:, :, :3]
-            pm = cv2.cvtColor(pm, cv2.COLOR_BGR2GRAY)
+        # 8-bit first: a 16-bit mask divided by 255 below gave weights up
+        # to 257 instead of 0..1.
+        pm = to_bgr_or_bgra_uint8(imread(args.priority_mask, cv2.IMREAD_UNCHANGED))
+        pm = cv2.cvtColor(pm[:, :, :3], cv2.COLOR_BGR2GRAY)
         tgt_h, tgt_w = output_img_np.shape[:2]
         pm_resized = cv2.resize(pm, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
         pm_float = pm_resized.astype(np.float32) / 255.0
         focus_map_full = torch.tensor(pm_float, dtype=torch.float32, device=device)
-        cv2.imwrite(
+        # ImageHelper.imwrite: cv2.imwrite writes nothing to a non-ASCII
+        # path on Windows.
+        imwrite(
             os.path.join(args.output_folder, "priority_mask_resized.png"),
             (pm_float * 255).astype(np.uint8),
         )
+        focus_map_full = focus_map_full * priority_mask_scale(
+            getattr(args, "priority_mask_strength", DEFAULT_PRIORITY_MASK_STRENGTH)
+        )
     return focus_map_full
+
+
+DEFAULT_PRIORITY_MASK_STRENGTH = 10.0
+
+
+def height_guidance_maps(args, output_img_np: np.ndarray, alpha: Optional[np.ndarray] = None, depth_fn=None):
+    """The pixel targets of --height_guidance / --height_regions at the
+    output resolution: ``(target, weight)`` or ``(None, None)``."""
+    from autoforge.Helper.HeightGuidance import GuidanceSpec, build_target_maps, parse_spec
+
+    raw = getattr(args, "height_guidance", "") or ""
+    regions_path = getattr(args, "height_regions", "") or ""
+    if not raw and not regions_path:
+        return None, None
+    spec = (parse_spec(raw) if raw else None) or GuidanceSpec()
+    if spec.strength <= 0:
+        return None, None
+    regions = None
+    if regions_path:
+        img = imread(regions_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"Height regions image not found: {regions_path}")
+        img = to_bgr_or_bgra_uint8(img)
+        if img.shape[2] == 4:
+            regions = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+    return build_target_maps(spec, output_img_np, regions, alpha, depth_fn=depth_fn)
+
+
+def guidance_init_target(args, output_img_np: np.ndarray, alpha: Optional[np.ndarray] = None, depth_fn=None):
+    """``(target, weight)`` for the height map initialisation (see
+    init_height_map's ``height_target``), or None without pixel guidance."""
+    target, weight = height_guidance_maps(args, output_img_np, alpha, depth_fn)
+    if target is None or not np.any(weight > 0):
+        return None
+    return target, weight
+
+
+def attach_height_guidance(
+    optimizer: FilamentOptimizer,
+    args,
+    output_img_np: np.ndarray,
+    alpha: Optional[np.ndarray] = None,
+    material_names=(),
+    material_uuids=(),
+    material_colors_hex=(),
+    depth_fn=None,
+) -> None:
+    """Set ``optimizer.guidance`` from --height_guidance / --height_regions
+    (None when they ask for nothing). The maps are built at the output
+    resolution ``output_img_np``; the costs resize them as needed."""
+    from autoforge.Helper.HeightGuidance import (
+        HeightGuidance,
+        material_index_lookup,
+        parse_spec,
+    )
+
+    optimizer.guidance = None
+    raw = getattr(args, "height_guidance", "") or ""
+    regions_path = getattr(args, "height_regions", "") or ""
+    if not raw and not regions_path:
+        return
+    lookup = material_index_lookup(material_uuids, material_names, material_colors_hex)
+    spec = parse_spec(raw, lookup) if raw else None
+    if spec is None:
+        from autoforge.Helper.HeightGuidance import GuidanceSpec
+
+        spec = GuidanceSpec()
+    target, weight = height_guidance_maps(args, output_img_np, alpha, depth_fn)
+    g = HeightGuidance(
+        spec, optimizer.material_colors, optimizer.max_layers, target, weight, device=optimizer.device,
+        layer_height=optimizer.h,
+    )
+    if not g.active:
+        return
+    g.material_uuids = [str(u) for u in material_uuids]
+    # The axis of the pins and targets: the starting height map's top.
+    with torch.no_grad():
+        g.sync_top(_discretize_height_only(optimizer._apply_height_offset(), optimizer.h, optimizer.max_layers))
+    optimizer.guidance = g
+    print(
+        f"Height guidance: strength {spec.strength:g}, order {spec.order}, {len(g.pins)} pin(s)"
+        + (", pixel targets" if g.has_pixel else "")
+    )
+
+
+def priority_mask_scale(strength: float) -> float:
+    """Factor for a 0..1 priority mask so a fully masked pixel counts
+    `strength` times an unmasked one under compute_loss's weighting
+    (0.1 + 0.9 * mask): (0.1 + 0.9 * k) / 0.1 = strength. The default
+    strength of 10 gives exactly 1, i.e. the mask as loaded."""
+    strength = max(1.0, float(strength))
+    return (strength - 1.0) / 9.0
 
 
 def _initialize_heightmap(
@@ -559,6 +1003,8 @@ def _initialize_heightmap(
     bg_rgb: Tuple[float, float, float],
     material_colors_np: np.ndarray,
     random_seed: int,
+    progress=None,
+    height_target=None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Initialize the height map logits & labels using selected method.
 
@@ -606,6 +1052,8 @@ def _initialize_heightmap(
                 material_colors=material_colors_np,
                 focus_map=None,
                 num_runs=args.num_init_rounds,
+                progress=progress,
+                height_target=height_target,
             )
         )
     return pixel_height_logits_init, global_logits_init, pixel_height_labels
@@ -721,12 +1169,12 @@ def _run_optimization_loop(
         for i in tbar:
             loss_val = optimizer.step(record_best=i % args.discrete_check == 0)
 
-            optimizer.visualize(interval=100)
-            optimizer.log_to_tensorboard(interval=100)
+            optimizer.visualize(interval=500)
+            optimizer.log_to_tensorboard(interval=500)
 
             if (i + 1) % 100 == 0:
                 tbar.set_description(
-                    f"Iteration {i + 1}, Loss = {loss_val:.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
+                    f"Iteration {i + 1}, Loss = {loss_val.item():.4f}, best validation Loss = {optimizer.best_discrete_loss:.4f}, learning_rate= {optimizer.current_learning_rate:.6f}"
                 )
             if (
                 optimizer.best_step is not None
@@ -738,6 +1186,116 @@ def _run_optimization_loop(
                     "steps without improvement.",
                 )
                 break
+    # Free the captured graph's private memory pool before the (higher
+    # resolution) post-processing phases start allocating. `loss_val` aliases
+    # storage inside that pool on the graph path, so it has to go first or the
+    # pool stays pinned for the rest of the run.
+    loss_val = None
+    del loss_val
+    optimizer.release_cuda_graph()
+
+
+def _prune_colors_swaps_only(optimizer: FilamentOptimizer, args) -> None:
+    """Only the colour and swap reductions of ``FilamentOptimizer.prune``,
+    with the same limits and the same non-worsening guard."""
+    from autoforge.Helper.PruningHelper import prune_num_colors, prune_num_swaps
+
+    max_colors = max(1, args.pruning_max_colors - (2 if args.flatforge else 1))
+    optimizer._run_non_worsening(
+        "Reducing colors",
+        lambda: prune_num_colors(
+            optimizer,
+            max_colors,
+            optimizer.vis_tau,
+            None,
+            fast=args.fast_pruning,
+            chunking_percent=args.fast_pruning_percent,
+            pruning_batch_size=args.pruning_batch_size,
+        ),
+        forced=optimizer.solution_counts()[0] > max_colors,
+    )
+    optimizer._run_non_worsening(
+        "Reducing swaps",
+        lambda: prune_num_swaps(
+            optimizer,
+            args.pruning_max_swaps,
+            optimizer.vis_tau,
+            None,
+            fast=args.fast_pruning,
+            chunking_percent=args.fast_pruning_percent,
+            pruning_batch_size=args.pruning_batch_size,
+        ),
+        forced=optimizer.solution_counts()[1] > args.pruning_max_swaps,
+    )
+
+
+def _prune_sweep(optimizer: FilamentOptimizer, args) -> None:
+    """Experiment harness: prune one trained solution to several colour/swap
+    limits (``--prune_sweep "C:S,C:S,..."``), each from the same starting
+    point, and write every result to prune_sweep.json. The last
+    configuration's result stays in the optimizer for the normal export."""
+    snapshot = optimizer.solution_snapshot()
+    results = []
+    for spec in args.prune_sweep.split(","):
+        colors, swaps = (int(v) for v in spec.split(":"))
+        optimizer.restore_solution_snapshot(
+            {**snapshot, "best_params": {k: v.clone() for k, v in snapshot["best_params"].items()}}
+        )
+        args.pruning_max_colors, args.pruning_max_swaps = colors, swaps
+        _prune_colors_swaps_only(optimizer, args)
+        loss = PruningHelper.get_initial_loss(
+            optimizer.best_params["global_logits"].shape[0], optimizer
+        )
+        _, n_swaps, _ = optimizer.solution_counts()
+        n_colors = optimizer.print_colors()
+        results.append({"max_colors": colors, "max_swaps": swaps, "loss": loss,
+                        "colors": n_colors, "swaps": n_swaps})
+        print(f"PRUNE_SWEEP {colors}:{swaps} loss={loss:.4f} colors={n_colors} swaps={n_swaps}")
+    with open(os.path.join(args.output_folder, "prune_sweep.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f)
+
+
+def _discretize_height_only_best(optimizer: FilamentOptimizer) -> torch.Tensor:
+    """Discrete heights [H,W] (layers) of the best solution at the solver
+    resolution."""
+    from autoforge.Modules.Optimizer import _discretize_height_only
+
+    eff = optimizer._apply_height_offset(
+        optimizer.best_params["pixel_height_logits"], optimizer.best_params["height_offsets"]
+    )
+    return _discretize_height_only(eff, optimizer.h, optimizer.max_layers)
+
+
+def best_heights_at_output_res(
+    best_proc: Optional[torch.Tensor],
+    proc_init: Optional[np.ndarray],
+    full_init: torch.Tensor,
+    alpha: Optional[np.ndarray],
+) -> torch.Tensor:
+    """The best solution's per-pixel height logits at the output resolution.
+
+    Training runs at the processing resolution from ``proc_init`` (the
+    full-resolution init, downscaled). What it changed per pixel - the smooth
+    height field and the intermediate stack search's single-pixel refines -
+    is carried over onto the full-resolution init (nearest neighbour; exact
+    when the two resolutions agree). Restoring the plain init instead threw
+    the refined heights away while keeping the stack chosen for them, so the
+    exported result came out in wrong colors. Shared by the CLI and the
+    webui (pipeline_runner.export_results)."""
+    if best_proc is None or proc_init is None:
+        return full_init.clone()
+    delta = best_proc.detach().float() - torch.from_numpy(np.asarray(proc_init)).to(best_proc.device).float()
+    if delta.shape != full_init.shape:
+        delta = torch.nn.functional.interpolate(
+            delta[None, None], size=tuple(full_init.shape[-2:]), mode="nearest"
+        )[0, 0]
+    out = full_init + delta.to(device=full_init.device, dtype=full_init.dtype)
+    if alpha is not None:
+        a = alpha[..., 0] if alpha.ndim == 3 else alpha
+        if a.shape == tuple(out.shape):
+            transparent = torch.from_numpy(a < 128).to(out.device)
+            out[transparent] = full_init[transparent]
+    return out
 
 
 def _post_optimize_and_export(
@@ -753,6 +1311,7 @@ def _post_optimize_and_export(
     device: torch.device,
     focus_map_full: Optional[torch.Tensor],
     focus_map_proc: Optional[torch.Tensor],
+    processing_pixel_height_logits_init: Optional[np.ndarray] = None,
 ) -> float:
     """Finalize solution, optionally prune, and write all output artifacts.
 
@@ -772,22 +1331,77 @@ def _post_optimize_and_export(
         interval=1, namespace="post_opt", step=(post_opt_step := post_opt_step + 1)
     )
 
-    optimizer.pixel_height_logits = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
-    optimizer.best_params["pixel_height_logits"] = torch.from_numpy(
-        pixel_height_logits_init
-    ).to(device)
+    full_init = torch.from_numpy(pixel_height_logits_init).to(device)
+
+    # Under colour/swap limits the heights are trained, not assigned, but the
+    # stack is final: assigning every pixel its height for that stack at the
+    # output resolution beats the trained cluster heights by far (the height
+    # fine-tunes and seed search it replaces never came close).
+    assigned = optimizer.height_assign and optimizer.best_params is not None
+    if assigned:
+        # The trained heights are per-pixel assignments at solver resolution
+        # (the base logits moved during training), so the delta-on-init
+        # transfer below does not apply: start from them, upsampled, and
+        # assign again at the output resolution for the best stack.
+        from autoforge.Helper.HeightAssign import heights_to_logits
+        from autoforge.Helper.OptimizerHelper import batched_layer_material_indices
+
+        with torch.no_grad():
+            z_proc = _discretize_height_only_best(optimizer)
+            best_dg = batched_layer_material_indices(
+                optimizer.best_params["global_logits"],
+                optimizer.vis_tau,
+                optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0,
+            )
+        z0_full = torch.nn.functional.interpolate(
+            z_proc[None, None].float(), size=full_init.shape[-2:], mode="nearest"
+        )[0, 0]
+    else:
+        optimizer.best_params["pixel_height_logits"] = best_heights_at_output_res(
+            optimizer.best_params["pixel_height_logits"],
+            processing_pixel_height_logits_init,
+            full_init,
+            alpha,
+        )
+    optimizer.pixel_height_logits = full_init.clone()
+    optimizer.pixel_delta = None
     optimizer.target = output_target
     optimizer.pixel_height_labels = torch.tensor(
         pixel_height_labels, dtype=torch.int32, device=device
     )
     if focus_map_proc is not None and focus_map_full is not None:
         optimizer.focus_map = focus_map_full
+    if assigned:
+        with torch.no_grad():
+            z_full = optimizer.assigned_heights(best_dg, heights_to_logits(z0_full, optimizer.max_layers))
+            full_logits = heights_to_logits(z_full, optimizer.max_layers)
+        optimizer.best_params["pixel_height_logits"] = full_logits
+        optimizer.best_params["height_offsets"] = torch.zeros_like(optimizer.best_params["height_offsets"])
+        optimizer.pixel_height_logits = full_logits.clone()
 
     with torch.no_grad():
         with safe_autocast(device):
-            if args.perform_pruning:
+            if args.minimal_postprocess:
+                if args.perform_pruning and args.prune_sweep:
+                    _prune_sweep(optimizer, args)
+                elif args.perform_pruning:
+                    _prune_colors_swaps_only(optimizer, args)
+            elif args.perform_pruning:
+                # Same post-hoc height-offset fine-tune as the no-pruning
+                # path below, run before any pruning phase touches
+                # best_params - pruning's own greedy color/swap/layer search
+                # starts from whatever height is already there, so giving it
+                # the best achievable height first (rather than only
+                # fine-tuning once at the very end) lets every later phase
+                # benefit, not just the final output.
+                # With assigned heights (the default) every pixel already has
+                # its best height for the stack at the output resolution and
+                # the cluster offsets are zero: the offset fine-tune and the
+                # seed search (a different seed reads out a different stack,
+                # judged at heights assigned for this one) cannot win there.
+                if not assigned:
+                    optimizer.fine_tune_height_offsets(num_steps=200)
+
                 # Adjust pruning_max_colors to account for background and clear filament
                 # pruning_max_colors = total filaments needed
                 # Need to reserve slots: 1 for background (always), 1 for clear (FlatForge only)
@@ -807,7 +1421,8 @@ def _post_optimize_and_export(
                     max_swaps_allowed=args.pruning_max_swaps,
                     min_layers_allowed=args.min_layers,
                     max_layers_allowed=args.pruning_max_layer,
-                    search_seed=True,
+                    search_seed=not assigned,
+                    fine_tune_height=not assigned,
                     fast_pruning=args.fast_pruning,
                     fast_pruning_percent=args.fast_pruning_percent,
                     pruning_batch_size=args.pruning_batch_size,
@@ -817,6 +1432,25 @@ def _post_optimize_and_export(
                     namespace="post_opt",
                     step=(post_opt_step := post_opt_step + 1),
                 )
+            else:
+                # Pruning's rng_seed_search (a cheap post-hoc search over the
+                # material-selection RNG seed, given the already-converged
+                # best_params) normally only runs as pruning's first phase -
+                # skipping pruning entirely also skipped this refinement, even
+                # though it's independent of pruning and equally applicable
+                # here. Run it unconditionally so the non-pruning path gets
+                # the same free quality improvement.
+                # Baseline measured now, at the full output resolution the
+                # search scores at - best_discrete_loss comes from training
+                # at the processing resolution, so "beat the start" compared
+                # numbers from two different image sizes (see prune()).
+                start_loss = optimizer.solution_loss()
+                if start_loss is not None:
+                    optimizer.rng_seed_search(start_loss, 50, autoset_seed=True)
+                from autoforge.Helper.PruningHelper import optimise_swap_positions
+
+                optimise_swap_positions(optimizer, max_passes=3)
+                optimizer.fine_tune_height_offsets(num_steps=200)
 
             disc_global, disc_height_image = optimizer.get_discretized_solution(
                 best=True
@@ -825,8 +1459,12 @@ def _post_optimize_and_export(
             final_loss = PruningHelper.get_initial_loss(
                 optimizer.best_params["global_logits"].shape[0], optimizer
             )
-            with open(os.path.join(args.output_folder, "final_loss.txt"), "w") as f:
+            with open(os.path.join(args.output_folder, "final_loss.txt"), "w", encoding="utf-8") as f:
                 f.write(f"{final_loss}")
+            _, n_swaps, _ = optimizer.solution_counts()
+            with open(os.path.join(args.output_folder, "final_counts.json"), "w", encoding="utf-8") as f:
+                # colors: filaments of the print, the base included.
+                json.dump({"colors": optimizer.print_colors(), "swaps": n_swaps}, f)
 
             print("Done. Saving outputs...")
             comp_disc = optimizer.get_best_discretized_image()
@@ -838,9 +1476,9 @@ def _post_optimize_and_export(
                 step=(post_opt_step := post_opt_step + 1),
             )
 
-            comp_disc_np = comp_disc.cpu().numpy().astype(np.uint8)
+            comp_disc_np = image_to_uint8(comp_disc)
             comp_disc_np = cv2.cvtColor(comp_disc_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(
+            imwrite(
                 os.path.join(args.output_folder, "final_model.png"), comp_disc_np
             )
 
@@ -877,7 +1515,7 @@ def _post_optimize_and_export(
                 )
 
             if not args.flatforge:
-                background_layers = int(args.background_height // args.layer_height)
+                background_layers = int(round(args.background_height / args.layer_height))
                 swap_instructions = generate_swap_instructions(
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
@@ -886,9 +1524,10 @@ def _post_optimize_and_export(
                     args.background_height,
                     material_names,
                     getattr(args, "background_material_name", None),
+                    optimizer.base_material,
                 )
                 with open(
-                    os.path.join(args.output_folder, "swap_instructions.txt"), "w"
+                    os.path.join(args.output_folder, "swap_instructions.txt"), "w", encoding="utf-8"
                 ) as f:
                     for line in swap_instructions:
                         f.write(line + "\n")
@@ -899,8 +1538,11 @@ def _post_optimize_and_export(
                     args,
                     disc_global.cpu().numpy(),
                     disc_height_image.cpu().numpy(),
-                    output_target.shape[1],
-                    output_target.shape[0],
+                    *model_size_mm(
+                        output_target.shape[1],
+                        output_target.shape[0],
+                        args.stl_output_size,
+                    ),
                     os.path.join(args.output_folder, "final_model.stl"),
                     args.csv_file,
                 )
@@ -952,7 +1594,9 @@ def start(args, preview_callback=None) -> float:
     )
 
     # Read input image early (needed for auto background color)
-    img = imread(args.input_image, cv2.IMREAD_UNCHANGED)
+    # Grayscale, grayscale+alpha and 16-bit images are brought to 8-bit
+    # BGR(A) first - the code below indexes img.shape[2] and assumes 0-255.
+    img = to_bgr_or_bgra_uint8(imread(args.input_image, cv2.IMREAD_UNCHANGED))
     alpha = None
     if img.shape[2] == 4:
         alpha = img[:, :, 3]
@@ -996,6 +1640,7 @@ def start(args, preview_callback=None) -> float:
             bg_rgb,
             material_colors_np,
             random_seed,
+            height_target=guidance_init_target(args, output_img_np, alpha),
         )
     )
 
@@ -1039,9 +1684,45 @@ def start(args, preview_callback=None) -> float:
         alpha_proc=alpha_proc,
         preview_callback=preview_callback,
     )
+    attach_height_guidance(
+        optimizer, args, output_img_np, alpha,
+        material_names=material_names, material_colors_hex=colors_list,
+    )
 
     # Run optimization loop
     _run_optimization_loop(optimizer, args, device)
+
+    # record_best only fires every args.discrete_check steps (default 100),
+    # so with e.g. 1000 iterations the last checkpoint is at step 900 - the
+    # fully-trained final state (steps 900-999) is never evaluated as a best-
+    # solution candidate unless iterations happens to be a multiple of
+    # discrete_check. Repeated checks here, using the exact same (already
+    # training-proven) discretize+evaluate path with a fresh random seed each
+    # time, can only improve or hold best_discrete_loss - and a single check
+    # risks an unlucky seed making the (possibly genuinely superior) final
+    # continuous state look worse than an earlier checkpoint by chance, so it
+    # never gets picked as the base for rng_seed_search's later, more
+    # thorough search. This training loop has already finished, so the extra
+    # calls (cheap: one composite each) don't touch training dynamics/timing.
+    #
+    # (Tried swapping this for rng_seed_search's faster shared-eff-thick
+    # batched machinery instead of the plain per-attempt composite loop
+    # below, hoping to afford far more attempts for the same time budget -
+    # see results.tsv discard entry. It wasn't reliably cheaper per-attempt
+    # at this benchmark's small image size, needed ~300 attempts to beat
+    # this loop's 60, and pushed total time past what the extra loss
+    # reduction was worth. Kept the simpler, cheaper, already-validated loop.)
+    optimizer.finish_training()
+    optimizer.finalize_background(args, material_names)
+    if optimizer.bg_logits is not None:
+        try:
+            with open(os.path.join(args.output_folder, "auto_background_color.txt"), "a", encoding="utf-8") as f:
+                f.write(f"optimized_filament_color={args.background_color}\n")
+                f.write(f"optimized_filament_index={args.background_material_index}\n")
+        except Exception:
+            traceback.print_exc()
+
+    empty_cache(device)
 
     # Post-process, prune, and export outputs
     final_loss = _post_optimize_and_export(
@@ -1057,6 +1738,7 @@ def start(args, preview_callback=None) -> float:
         device,
         focus_map_full,
         focus_map_proc,
+        processing_pixel_height_logits_init=processing_pixel_height_logits_init,
     )
 
     return final_loss
@@ -1070,7 +1752,8 @@ def main() -> None:
     - Tracks losses, reports statistics (best / median / std).
     - Moves files from best run folder into the final output folder.
 
-    Note: Memory is periodically reclaimed (gc + CUDA cache clears + closing matplotlib figures).
+    Note: Memory is periodically reclaimed (gc + GPU cache clears on whichever
+    backend is active + closing matplotlib figures).
     """
     args = parse_args()
     final_output_folder = args.output_folder
@@ -1084,24 +1767,42 @@ def main() -> None:
             try:
                 print(f"Run {i + 1}/{args.best_of}")
                 run_folder = os.path.join(temp_output_folder, f"run_{i + 1}")
-                args.output_folder = run_folder
-                os.makedirs(args.output_folder, exist_ok=True)
-                run_loss = start(args)
+                # Each run gets its own copy: start() writes results back into
+                # its args (the pruned max_layers, the auto-picked background
+                # color, ...), and a shared namespace handed them to every
+                # later run - run 2 onwards started with run 1's pruned layer
+                # count instead of the requested --max_layers.
+                run_args = copy.copy(args)
+                run_args.output_folder = run_folder
+                # A fixed seed is the first run's; the others count up from it
+                # (the same seed every run made runs 2..N exact repeats).
+                # Seed 0 already draws a fresh seed per run in set_seed().
+                if args.random_seed != 0:
+                    run_args.random_seed = args.random_seed + i
+                print(f"Run {i + 1} seed: {run_args.random_seed if run_args.random_seed != 0 else 'random'}")
+                os.makedirs(run_args.output_folder, exist_ok=True)
+                run_loss = start(run_args)
                 print(f"Run {i + 1} finished with loss: {run_loss}")
                 if run_loss < run_best_loss:
                     run_best_loss = run_loss
                     print(f"New best loss found: {run_best_loss} in run {i + 1}")
                 ret.append((run_folder, run_loss))
-                torch.cuda.empty_cache()
+                empty_cache()
                 import gc
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
                 import matplotlib.pyplot as plt
 
                 plt.close("all")
             except Exception:
                 traceback.print_exc()
+        if not ret:
+            print(
+                f"Error: all {args.best_of} runs failed; see the errors above.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         best_run = min(ret, key=lambda x: x[1])
         best_run_folder = best_run[0]
         best_loss = best_run[1]
@@ -1120,7 +1821,9 @@ def main() -> None:
             src_file = os.path.join(best_run_folder, file)
             dst_file = os.path.join(final_output_folder, file)
             if os.path.isfile(src_file):
-                os.rename(src_file, dst_file)
+                os.replace(src_file, dst_file)
+        # Every run's files lived in temp/; the best one's are now in place.
+        shutil.rmtree(temp_output_folder, ignore_errors=True)
 
 
 if __name__ == "__main__":

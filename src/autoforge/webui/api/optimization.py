@@ -1,0 +1,687 @@
+import asyncio
+import os
+import logging
+import numpy as np
+import base64
+import shutil
+import threading
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from ..models import OptimizationSettings, StateSnapshot
+from ..services.optimization_service import get_optimization_service
+from ..services.project_service import get_project_service
+from ..services.filament_service import get_filament_service
+from ..helpers.pipeline_runner import run_pipeline as _run_pipeline, run_best_of as _run_best_of, friendly_error_message
+from ..helpers.gpu_memory import empty_device_cache, release_pipeline_result
+from ..helpers.telemetry import capture_exception
+from ..services.image_service import get_image_service
+from ..config import config
+from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
+from .ws import broadcast_preview, encode_png_b64
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def _live_base(optimizer, filament_dicts, settings) -> dict | None:
+    """The base as the optimizer has it right now (see derive_base_from_result
+    for the finished result)."""
+    try:
+        rgb = [int(round(float(c) * 255)) for c in optimizer.background.detach().cpu().tolist()]
+        idx = getattr(optimizer, "base_material", None)
+        uuid = str(filament_dicts[idx].get("uuid", "")) if idx is not None and idx < len(filament_dicts) else ""
+        lh = float(settings.layer_height) or 0.04
+        return {
+            "color": "#" + "".join(f"{c:02X}" for c in rgb),
+            "height_mm": round(float(settings.background_height), 4),
+            "layers": int(round(float(settings.background_height) / lh)),
+            "filament_uuid": uuid,
+            "auto": bool(settings.auto_background_color),
+        }
+    except Exception:
+        return None
+
+
+def _derive_sliders(optimizer, filament_dicts):
+    """Best-effort slider derivation; returns None when not possible."""
+    try:
+        import numpy as np
+        from ..helpers.sliders import derive_sliders_from_optimizer
+        material_tds = np.array(
+            [float(f.get("td", 0.0)) for f in filament_dicts], dtype=np.float64
+        )
+        material_uuids = [str(f.get("uuid", "")) for f in filament_dicts]
+        layer_height = float(getattr(optimizer, "h", 0.04))
+        return derive_sliders_from_optimizer(
+            optimizer, material_tds, material_uuids, layer_height
+        )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _broadcast_final_result(result: dict, job_id: str) -> None:
+    """Push the finished result's slider stack, image and base to the UI.
+
+    The last training preview isn't the result: the pipeline keeps refining
+    the solution after training (stack search, pixel refinement, limits), so
+    the color layers stayed on a stack with a different number of bands than
+    the stored result, and the next slider render rebuilt the mesh from it.
+    """
+    try:
+        from ..helpers.sliders import derive_base_from_result, derive_sliders_from_result
+
+        slider_data = derive_sliders_from_result(result)
+        image = result["optimizer"].get_best_discretized_image()
+        if not (slider_data and slider_data["sliders"]) or image is None:
+            return
+        broadcast_preview(
+            encode_png_b64(image),
+            job_id=job_id,
+            sliders=slider_data["sliders"],
+            min_layer=slider_data["min_layer"],
+            max_layer=slider_data["max_layer"],
+            base=derive_base_from_result(result),
+        )
+    except Exception:
+        logger.exception("Could not send the final result of job %s", job_id)
+
+
+# Best of N: every finished run is saved under the job's folder until the
+# user picked the one to keep (see _choose_run).
+CANDIDATES_DIR = "best_of_runs"
+CANDIDATE_IMAGE = "preview.png"
+
+
+def _candidate_dir(output_dir: str, index: int) -> str:
+    return os.path.join(output_dir, CANDIDATES_DIR, f"run_{index}")
+
+
+class _Choice:
+    def __init__(self, runs: int, live_run: int):
+        self.runs = runs
+        self.live_run = live_run
+        self.picked: int | None = None
+        self.event = threading.Event()
+
+
+# The series waiting for the user to pick a run, by job id.
+_choices: dict[str, _Choice] = {}
+_choices_lock = threading.Lock()
+
+
+def _choose_run(job_id: str, losses: list[float], best_index: int, cancel_event) -> int | None:
+    """Wait until the user picks one of the finished runs (POST
+    /best-of/{job_id}/pick). Returns its index, or None once the job was
+    cancelled. The job stays "running" meanwhile: nothing else may start,
+    and the run on the device is still the one the export may need."""
+    svc = get_optimization_service()
+    choice = _Choice(len(losses), best_index)
+    with _choices_lock:
+        _choices[job_id] = choice
+    try:
+        # Nothing is left to pause; a pause pressed as the last run finished
+        # would also drop this report (see update_status).
+        if (job := svc.get_job(job_id)) is not None and job.status == "paused":
+            svc.resume(job_id)
+        svc.update_status(
+            job_id, "running", phase="Choose a result", progress=95.0,
+            best_of_losses=losses, best_of_run=best_index, best_of_choosing=True,
+        )
+        while not choice.event.wait(0.2):
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+        return choice.picked
+    finally:
+        with _choices_lock:
+            _choices.pop(job_id, None)
+        svc.update_status(job_id, "running", best_of_choosing=False)
+
+
+class BestOfPick(BaseModel):
+    run: int
+
+
+@router.post("/best-of/{job_id}/pick")
+async def pick_best_of_run(job_id: str, body: BestOfPick):
+    """Keep run ``body.run`` (0-based) of a best-of series waiting for a
+    choice; the job then finishes with it like a single run would."""
+    with _choices_lock:
+        choice = _choices.get(job_id)
+        if choice is None or choice.event.is_set():
+            raise HTTPException(409, "This optimization isn't waiting for a choice anymore.")
+        if not 0 <= body.run < choice.runs:
+            raise HTTPException(400, f"There is no run {body.run + 1}.")
+        if body.run != choice.live_run and not os.path.isfile(
+            os.path.join(_candidate_dir(os.path.join(config.checkpoints_path, job_id), body.run), "solution.npz")
+        ):
+            raise HTTPException(409, f"Run {body.run + 1} wasn't saved and can't be used. Pick another one.")
+        choice.picked = body.run
+        choice.event.set()
+    return {"status": "running", "run": body.run}
+
+
+@router.get("/best-of/{job_id}/image/{run}")
+async def best_of_run_image(job_id: str, run: int):
+    """The finished image of run ``run`` (0-based) of a series still
+    waiting for a choice."""
+    if get_optimization_service().get_job(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    path = os.path.join(_candidate_dir(os.path.join(config.checkpoints_path, job_id), run), CANDIDATE_IMAGE)
+    if run < 0 or not os.path.isfile(path):
+        raise HTTPException(404, "No image for this run")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.post("/start")
+async def start_optimization(settings: OptimizationSettings):
+    svc = get_optimization_service()
+    filament_svc = get_filament_service()
+
+    # Log what we received
+    settings_dict = settings.model_dump()
+    logger.info("start_optimization called: input_image=%r, iterations=%d, filaments_active=%d",
+                settings_dict.get("input_image", ""),
+                settings.iterations,
+                len(filament_svc.get_active()))
+
+    # Validate up front, synchronously, before creating/starting a job — the
+    # job used to be created and flipped to "running" first, with these same
+    # checks only run *inside* the background thread a moment later. That
+    # meant "no active filaments" or "no input image" briefly looked like a
+    # real run (status: running) before immediately failing, instead of
+    # being rejected outright.
+    active = filament_svc.get_active()
+    if not active:
+        raise HTTPException(
+            400,
+            "Add at least one active filament before running optimization. "
+            "Open the Filament Library panel, find a filament and drag it "
+            "onto the 'Active Filaments' area, or click the '+' button to "
+            "add it to the active list.",
+        )
+    input_image_path = settings_dict.get("input_image", "")
+    if not input_image_path:
+        raise HTTPException(400, "Upload an input image before running optimization.")
+    base_error = settings.base_height_error()
+    if base_error:
+        raise HTTPException(400, base_error)
+
+    filament_dicts = [
+        {"color": f.color, "td": f.td, "name": f"{f.brand} - {f.name}",
+         "brand": f.brand, "short_name": f.name, "owned": f.owned,
+         "uuid": f.uuid, "filament_type": f.filament_type}
+        for f in active
+    ]
+
+    # One GPU job at a time: a second run (e.g. "Start Optimization" in the
+    # Settings dialog while the first was paused) competed for the same GPU
+    # memory and left two jobs broadcasting into the same preview. Pruning
+    # counts too — it runs the same optimizer the new run would clear out.
+    # A cancelled job is "cancelled" at once, but its thread only stops at its
+    # next check; starting now would put two jobs on the GPU (see workers).
+    if running_worker() is not None and await asyncio.to_thread(wait_until_idle, 2.0) is not None:
+        raise HTTPException(409, STILL_STOPPING)
+
+    from ..helpers.guidance_views import QUICK_PREVIEW_BUSY, quick_preview_running
+
+    if quick_preview_running():
+        raise HTTPException(409, QUICK_PREVIEW_BUSY)
+    busy = svc.get_any_active_job()
+    if busy is not None:
+        if busy.job_id.startswith("prune-"):
+            raise HTTPException(
+                409,
+                f"Pruning is {busy.status}. Let it finish or cancel it before starting a new optimization.",
+            )
+        raise HTTPException(
+            409,
+            f"An optimization is already {busy.status}. Resume or cancel it before starting a new one.",
+        )
+
+    from .init import is_init_building
+
+    if is_init_building():
+        raise HTTPException(
+            409,
+            "The preview of the image is still being prepared. Wait for it to finish, then try again.",
+        )
+
+    job = svc.create_job(settings_dict)
+
+    def _run():
+        nonlocal input_image_path
+        run_device = None
+        output_dir = None
+        try:
+            svc.update_status(job.job_id, "running",
+                              total_iterations=settings.iterations,
+                              phase="Preparing")
+
+            # A run that has already been cancelled must not touch any other
+            # job's retained result: releasing them here was what made a
+            # cancelled (or OOM-during-init) run leave the previous, still
+            # completed, job un-prunable and un-re-colorable.
+            cancel_event = svc.cancel_event(job.job_id)
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
+            # Hand back every earlier run's device memory *before* this one
+            # allocates. Each retained pipeline result pins a whole optimizer
+            # (parameters, Adam state, target images) on the GPU, so running
+            # image after image without this climbed until a later run OOM'd.
+            # Only the newest result is reachable from the UI anyway — the
+            # Pruning dialog always targets the job currently on screen.
+            svc.clear_all_pipeline_results()
+
+
+            output_dir = os.path.join(config.checkpoints_path, job.job_id)
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Resolve to a real path under the uploads directory only — an
+            # arbitrary existing server path (e.g. "../../etc/passwd" or an
+            # absolute path outside uploads/) used to be accepted verbatim
+            # whenever os.path.exists() happened to be true for it.
+            resolved_path = get_image_service().get_path(input_image_path)
+            if resolved_path is None:
+                err = f"Input image not found: {input_image_path}"
+                logger.error(err)
+                svc.update_status(job.job_id, "failed", error=err)
+                return
+            input_image_path = resolved_path
+
+            # The focus-area mask painted in the image panel is uploaded like
+            # an image and referenced by its uploads/ file name. Resolve it the
+            # same guarded way: only files under uploads/ are accepted.
+            run_settings = dict(settings_dict)
+            mask_name = run_settings.get("priority_mask") or ""
+            if mask_name:
+                mask_path = get_image_service().get_path(mask_name)
+                if mask_path is None:
+                    err = (f"Focus-area mask not found: {mask_name}. "
+                           "Clear the focus areas in the image panel, or paint them again.")
+                    logger.error(err)
+                    svc.update_status(job.job_id, "failed", error=err)
+                    return
+                run_settings["priority_mask"] = mask_path
+            regions_name = run_settings.get("height_regions") or ""
+            if regions_name:
+                regions_path = get_image_service().get_path(regions_name)
+                if regions_path is None:
+                    err = (f"Height regions not found: {regions_name}. "
+                           "Clear the painted height regions, or paint them again.")
+                    logger.error(err)
+                    svc.update_status(job.job_id, "failed", error=err)
+                    return
+                run_settings["height_regions"] = regions_path
+
+            logger.info("Optimization starting: image=%s, filaments=%d, iters=%d",
+                        input_image_path, len(filament_dicts), settings.iterations)
+
+            cancel_event = svc.cancel_event(job.job_id)
+            pause_event = svc.pause_event(job.job_id)
+
+            # The whole run on one bar, each step in its own slice so the bar
+            # keeps moving: the height estimate, training, the final search
+            # within the colour/swap limits (only with limits) and the export.
+            # With best of N, the runs share everything before the export
+            # equally, and each phase is named after its run.
+            series = {"index": 0, "total": max(1, int(settings.best_of))}
+            # A single run is pruned after it finished (the frontend starts
+            # that); each run of a series is pruned before it is shown, since
+            # pruning changes the result the user picks from.
+            prune_each = series["total"] > 1 and settings.auto_initial_prune
+
+            limited = settings.max_colors is not None or settings.max_swaps is not None
+            run_end = 90.0 if prune_each else 95.0
+            train_end = run_end - 7.0 if limited else run_end
+            slices = {
+                "Estimating heights": (0.0, 5.0),
+                "Optimizing": (5.0, train_end - 1.0),
+                "Choosing the base filament": (train_end - 1.0, train_end),
+                "Refining within the limits": (train_end, run_end),
+                "Pruning": (run_end, 95.0),
+                "Exporting results": (95.0, 100.0),
+            }
+
+            def _overall(phase, fraction):
+                lo, hi = slices[phase]
+                value = lo + (hi - lo) * min(1.0, max(0.0, float(fraction)))
+                if phase == "Exporting results":
+                    return value
+                return (series["index"] * 95.0 + value) / series["total"]
+
+            def _label(phase):
+                if series["total"] == 1 or phase == "Exporting results":
+                    return phase
+                return f"Run {series['index'] + 1}/{series['total']} · {phase}"
+
+            def _run_callback(index, total, losses):
+                series["index"] = index
+                try:
+                    svc.update_status(
+                        job.job_id, "running", phase=_label("Estimating heights"),
+                        progress=_overall("Estimating heights", 0.0), iteration=0, best_of_losses=losses,
+                    )
+                except Exception:
+                    pass
+
+            # Each finished run of a series is saved, so the user can look at
+            # all of them and pick one (see _choose_run).
+            candidates_dir = os.path.join(output_dir, CANDIDATES_DIR)
+            if series["total"] > 1:
+                shutil.rmtree(candidates_dir, ignore_errors=True)
+
+            def _save_candidate(index, state, loss):
+                """Save a finished run of the series, pruned first when runs
+                are; returns its loss after pruning."""
+                from ..helpers.pipeline_runner import initial_prune, solution_loss, to_output_resolution
+                from ..helpers.result_store import save_solution
+
+                # Saved as the export will have it (see to_output_resolution).
+                to_output_resolution(state)
+                pruned_loss = None
+                if prune_each:
+                    _phase_callback("Pruning", 0.0)
+                    if not initial_prune(
+                        state, settings.initial_prune_seed_search_count,
+                        cancel_event=cancel_event, pause_event=pause_event,
+                    ):
+                        return None  # cancelled; the series stops
+                    pruned_loss = solution_loss(state)
+                    _phase_callback("Pruning", 1.0)
+                run_dir = _candidate_dir(output_dir, index)
+                try:
+                    save_solution(run_dir, state)
+                    image = state["optimizer"].get_best_discretized_image()
+                    if image is not None:
+                        with open(os.path.join(run_dir, CANDIDATE_IMAGE), "wb") as f:
+                            f.write(base64.b64decode(encode_png_b64(image)))
+                except Exception:
+                    logger.exception("Could not save run %d of job %s", index + 1, job.job_id)
+                return pruned_loss
+
+            def _choose(losses, best_index):
+                return _choose_run(job.job_id, losses, best_index, cancel_event)
+
+            def _restore(index):
+                from ..helpers.result_store import load_solution, rebuild_pipeline_result
+
+                svc.update_status(job.job_id, "running", phase=f"Loading run {index + 1}")
+                solution = load_solution(_candidate_dir(output_dir, index))
+                if solution is None:
+                    raise RuntimeError(f"Run {index + 1} could not be loaded back.")
+                restored = rebuild_pipeline_result(solution, input_image_path, output_dir)
+                # The rebuild only knows each filament's color, TD and name;
+                # the export writes the rest (brand, type) into the project.
+                restored["active_filaments"] = filament_dicts
+                return restored
+
+            def _phase_callback(phase, fraction):
+                try:
+                    svc.update_status(job.job_id, "running", phase=_label(phase), progress=_overall(phase, fraction))
+                except Exception:
+                    pass
+
+            def _progress_callback(opt, step):
+                """Lightweight progress update — always succeeds regardless of image generation."""
+                try:
+                    total = max(settings.iterations, 1)
+                    loss_val = (
+                        opt.best_discrete_loss.item()
+                        if hasattr(opt.best_discrete_loss, 'item')
+                        else opt.best_discrete_loss
+                    ) if opt.best_discrete_loss is not None else None
+                    svc.update_status(
+                        job.job_id, "running",
+                        progress=_overall("Optimizing", step / total),
+                        iteration=step,
+                        loss=loss_val,
+                        total_iterations=settings.iterations,
+                        phase=_label("Optimizing"),
+                    )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+            def _preview_callback(opt, step):
+                """Progress + preview image. Always sends progress first, then image if available."""
+                _progress_callback(opt, step)
+                try:
+                    img = opt.get_best_discretized_image()
+                    if img is not None:
+                        loss_val = (
+                            opt.best_discrete_loss.item()
+                            if hasattr(opt.best_discrete_loss, 'item')
+                            else opt.best_discrete_loss
+                        ) if opt.best_discrete_loss is not None else None
+                        b64 = encode_png_b64(img)
+                        svc.update_status(
+                            job.job_id, "running",
+                            progress=_overall("Optimizing", step / max(settings.iterations, 1)),
+                            iteration=step, loss=loss_val,
+                            preview_image=b64,
+                            total_iterations=settings.iterations,
+                        )
+                        slider_data = _derive_sliders(opt, filament_dicts)
+                        broadcast_preview(
+                            b64,
+                            job_id=job.job_id,
+                            sliders=slider_data["sliders"] if slider_data else None,
+                            iteration=step,
+                            loss=loss_val,
+                            min_layer=slider_data["min_layer"] if slider_data else None,
+                            max_layer=slider_data["max_layer"] if slider_data else None,
+                            base=_live_base(opt, filament_dicts, settings),
+                        )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+            result = _run_best_of(
+                input_image_path=input_image_path,
+                active_filaments=filament_dicts,
+                output_dir=output_dir,
+                settings=run_settings,
+                best_of=settings.best_of,
+                run_callback=_run_callback,
+                pipeline=_run_pipeline,
+                candidate_callback=_save_candidate,
+                choose=_choose,
+                restore=_restore,
+                preview_callback=_preview_callback,
+                progress_callback=_progress_callback,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                phase_callback=_phase_callback,
+            )
+
+            run_device = result.get("device")
+            cancelled = result.get("cancelled", False)
+            if cancelled:
+                svc.update_status(job.job_id, "cancelled")
+                # Nothing keeps a cancelled run's state — and nothing will
+                # ever ask for it again, so its device memory goes back now
+                # rather than whenever this frame happens to be collected.
+                release_pipeline_result(result)
+                return
+
+            # Store pipeline result for pruning later
+            svc.set_pipeline_result(job.job_id, result)
+            logger.info("Optimization completed: job_id=%s", job.job_id)
+
+            # Generate output files (STL, colored PLY, preview PNG, swap instructions)
+            _phase_callback("Exporting results", 0.0)
+            try:
+                from ..helpers.pipeline_runner import export_results
+                export_results(result, export_progress=lambda f: _phase_callback("Exporting results", f))
+                logger.info("Output files written to %s", output_dir)
+            except Exception as exc:
+                # A run whose export failed (e.g. OOM building the full-res
+                # composite, or a disk write error) has no STL/PLY/project
+                # files on disk, so downloads would 404. It used to still be
+                # marked "completed" here — a green run with a broken
+                # "Download" button and no error visible anywhere in the UI.
+                logger.error("Export failed for job %s: %s", job.job_id, exc)
+                capture_exception(exc, {"phase": "export", "job_id": job.job_id})
+                # Nothing can use a failed job's result; give its device
+                # memory back instead of holding it until the next run.
+                svc.clear_pipeline_result(job.job_id)
+                svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
+                return
+
+            # The solution on disk, so the result can be pruned and re-colored
+            # after a restart or once a newer result replaced it in memory.
+            try:
+                from ..helpers.result_store import save_solution
+
+                save_solution(output_dir, result)
+            except Exception as exc:
+                logger.exception("Could not save the solution of job %s", job.job_id)
+                capture_exception(exc, {"phase": "save_solution", "job_id": job.job_id})
+
+            # Before "completed", so the snapshot taken on completion holds
+            # the result's own stack rather than the last training preview.
+            _broadcast_final_result(result, job.job_id)
+
+            # What the result has, counted like the pruning dialog counts it
+            # — with color/swap limits set, the UI shows them held.
+            counts = {}
+            try:
+                from ..helpers.sliders import result_counts_from_optimizer
+
+                value = result_counts_from_optimizer(result["optimizer"])
+                if value:
+                    counts = {
+                        "result_colors": value["colors"],
+                        "result_swaps": value["swaps"],
+                        "result_layers": value["layers"],
+                    }
+            except Exception:
+                logger.exception("Could not count the result of job %s", job.job_id)
+            try:
+                from ..helpers.sliders import guidance_report_from_optimizer
+
+                report = guidance_report_from_optimizer(result["optimizer"])
+                if report is not None:
+                    counts["guidance_report"] = report
+            except Exception:
+                logger.exception("Could not report the height guidance of job %s", job.job_id)
+            if result.get("best_of"):
+                counts["best_of_losses"] = result["best_of"]["losses"]
+                counts["best_of_run"] = result["best_of"]["best_run"]
+                # The kept run's, not the last run's last progress report.
+                counts["loss"] = result["best_of"]["losses"][result["best_of"]["best_run"]]
+                counts["best_of_pruned"] = prune_each
+            svc.update_status(job.job_id, "completed",
+                              phase=None,
+                              progress=100.0,
+                              iteration=settings.iterations,
+                              total_iterations=settings.iterations,
+                              **counts)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error("Optimization failed: %s", e)
+            capture_exception(e, {"phase": "optimization", "job_id": job.job_id})
+            svc.update_status(job.job_id, "failed", error=friendly_error_message(e))
+        finally:
+            if output_dir is not None:
+                # Only needed until a run was picked.
+                shutil.rmtree(os.path.join(output_dir, CANDIDATES_DIR), ignore_errors=True)
+            # Training and export both leave large freed blocks in the
+            # caching allocator. Returning them keeps `nvidia-smi` honest and,
+            # more importantly, leaves room for the next image's init.
+            empty_device_cache(run_device)
+
+    start_worker(job.job_id, _run)
+
+    return {
+        "job_id": job.job_id,
+        "total_iterations": settings.iterations,
+        "status": "running",
+    }
+
+
+@router.post("/pause/{job_id}")
+async def pause_optimization(job_id: str):
+    svc = get_optimization_service()
+    with _choices_lock:
+        choosing = job_id in _choices
+    if choosing:
+        # All runs are done; the series only waits for the user's choice.
+        job = svc.get_job(job_id)
+        return {"status": job.status if job else "running"}
+    if not svc.pause(job_id):
+        raise HTTPException(404, "Job not found")
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
+
+
+@router.post("/resume/{job_id}")
+async def resume_optimization(job_id: str):
+    svc = get_optimization_service()
+    if not svc.resume(job_id):
+        raise HTTPException(404, "Job not found")
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
+
+
+@router.post("/cancel/{job_id}")
+async def cancel_optimization(job_id: str):
+    svc = get_optimization_service()
+    if not svc.cancel(job_id):
+        raise HTTPException(404, "Job not found")
+    # The job's real status, not an assumed one — a job that already
+    # finished is left untouched, and the client needs to know that.
+    return {"status": svc.get_job(job_id).status}
+
+
+# The preview image is a full base64 PNG that is only meaningful on the live
+# /ws/preview channel. Excluding it from every status payload keeps the
+# 0.5 s WS polls and 1 s status polls small, and stops it leaking into
+# history.json (which it grew without bound when it was serialized there).
+_STATUS_EXCLUDES = {"preview_image"}
+
+
+def _job_payload(job) -> dict:
+    return job.model_dump(exclude=_STATUS_EXCLUDES)
+
+
+@router.get("/status/{job_id}")
+async def get_status(job_id: str):
+    svc = get_optimization_service()
+    job = svc.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return _job_payload(job)
+
+
+@router.get("/latest")
+async def get_latest_job():
+    svc = get_optimization_service()
+    job = svc.get_latest_job()
+    if not job:
+        raise HTTPException(404, "No jobs yet")
+    return _job_payload(job)
+
+
+@router.get("/history")
+async def get_history():
+    svc = get_optimization_service()
+    results = svc.get_history()
+    return [_job_payload(r) for r in results]
+
+
+@router.get("/result/{job_id}")
+async def get_result(job_id: str):
+    svc = get_optimization_service()
+    result = svc.get_result(job_id)
+    if not result:
+        raise HTTPException(404, "Result not found")
+    return _job_payload(result)
