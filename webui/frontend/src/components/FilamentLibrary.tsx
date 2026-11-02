@@ -1,7 +1,7 @@
 import React from 'react'
 import { useAppStore } from '../store/appStore'
 import { useFilamentLoader } from '../services/filamentService'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronsLeft, Globe, Hand, Pencil, Plus, Save, Search, Tag, Upload, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronsLeft, Globe, Hand, ListPlus, Pencil, Plus, Save, Search, Tag, Upload, X } from 'lucide-react'
 import type { Filament } from '../types'
 import { FilamentSwatch } from './FilamentSwatch'
 import { EditFilamentModal } from './EditFilamentModal'
@@ -41,6 +41,7 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
   const setActiveTab = useAppStore((s) => s.setActiveTab)
   const setFilterQuery = useAppStore((s) => s.setFilterQuery)
   const setNewFilamentModalOpen = useAppStore((s) => s.setNewFilamentModalOpen)
+  const setBulkAddModalOpen = useAppStore((s) => s.setBulkAddModalOpen)
   const setImportModalOpen = useAppStore((s) => s.setImportModalOpen)
   const setCatalogModalOpen = useAppStore((s) => s.setCatalogModalOpen)
   const customLibraryLoaded = useAppStore((s) => s.customLibraryLoaded)
@@ -236,6 +237,14 @@ export const FilamentLibrary: React.FC<{ onCollapse?: () => void }> = ({ onColla
         <div className="flex items-center gap-1.5">
           <button onClick={() => setNewFilamentModalOpen(true)} className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-cyan-600 hover:bg-cyan-500 text-white" data-testid="new-filament-btn">
             <Plus className="w-3.5 h-3.5" /> New
+          </button>
+          <button
+            onClick={() => setBulkAddModalOpen(true)}
+            className={secondaryButton}
+            title="Type or paste in several filaments you own at once, with their TD — no file needed"
+            data-testid="bulk-add-btn"
+          >
+            <ListPlus className="w-3.5 h-3.5" /> Bulk Add
           </button>
           <button
             onClick={() => setCatalogModalOpen(true)}

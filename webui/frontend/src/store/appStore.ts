@@ -504,6 +504,7 @@ interface AppState {
   initState: InitState
   hasRenderedInitPreview: boolean
   newFilamentModalOpen: boolean
+  bulkAddModalOpen: boolean
   importModalOpen: boolean
   catalogModalOpen: boolean
   /** The import dialog was opened by the one-time first-start offer to
@@ -600,6 +601,7 @@ interface AppState {
   setInitState: (state: Partial<InitState>) => void
   setHasRenderedInitPreview: (val: boolean) => void
   setNewFilamentModalOpen: (open: boolean) => void
+  setBulkAddModalOpen: (open: boolean) => void
   setImportModalOpen: (open: boolean) => void
   setCatalogModalOpen: (open: boolean) => void
   openHueforgeImportOffer: () => void
@@ -698,6 +700,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   initState: { status: 'idle', preview_image: null },
   hasRenderedInitPreview: false,
   newFilamentModalOpen: false,
+  bulkAddModalOpen: false,
   importModalOpen: false,
   catalogModalOpen: false,
   importModalHueforgeOffer: false,
@@ -1085,6 +1088,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setInitState: (state) => set((prev) => ({ initState: { ...prev.initState, ...state } })),
   setHasRenderedInitPreview: (val) => set({ hasRenderedInitPreview: val }),
   setNewFilamentModalOpen: (open) => set({ newFilamentModalOpen: open }),
+  setBulkAddModalOpen: (open) => set({ bulkAddModalOpen: open }),
   setImportModalOpen: (open) => set({ importModalOpen: open, importModalHueforgeOffer: false }),
   setCatalogModalOpen: (open) => set({ catalogModalOpen: open }),
   openHueforgeImportOffer: () => set({ importModalOpen: true, importModalHueforgeOffer: true }),

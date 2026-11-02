@@ -13,6 +13,7 @@ import { ImageEditor } from './components/ImageEditor'
 import { StatusBar } from './components/StatusBar'
 import { SettingsModal } from './components/SettingsModal'
 import { NewFilamentModal } from './components/NewFilamentModal'
+import { BulkAddFilamentsModal } from './components/BulkAddFilamentsModal'
 import { ImportModal } from './components/ImportModal'
 import { CatalogModal } from './components/CatalogModal'
 import { TutorialModal } from './components/TutorialModal'
@@ -304,6 +305,7 @@ const App: React.FC = () => {
 
       <SettingsModal />
       <NewFilamentModal />
+      <BulkAddFilamentsModal />
       <ImportModal />
       <CatalogModal />
       <HistoryDrawer />
